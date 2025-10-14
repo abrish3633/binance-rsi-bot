@@ -884,7 +884,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Headless, 30m Optimized, Immediate Trailing Stop, Cleaned)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
-    parser.add_argument("--symbol", default="BTCUSDT", help="Trading symbol (default: BTCUSDT)")
+    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=3, help="Max trades per day (default: 3)")
     parser.add_argument("--risk-pct", type=float, default=1.0, help="Risk percentage per trade (default: 1%)")
