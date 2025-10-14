@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-# Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_EnhancedBuffer_FillPrice_Cleaned14_30m.py
-# Changes from Cleaned14.py for 30m timeframe:
-# - Changed INTERVAL_DEFAULT to "30m"
-# - Increased POSITION_CHECK_INTERVAL to 60 seconds
-# - Increased TRAIL_PRICE_BUFFER to 0.3%
-# - Increased ORDER_FILL_TIMEOUT to 15 seconds
-# - Enhanced RSI logging to 3 decimal places
-# - Added timeframe confirmation and candle open/close logging
+# Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
+# Changes from Cleaned14_30m.py:
+# - Changed default symbol to SOLUSDT
+# - Enabled use-volume-filter by default
+# - Added startup log for default parameters
+# - Retained 30m timeframe optimizations and MACD confirmation
+# - Risk-pct 0.5% already matched (RISK_PCT = 0.005)
 
 import argparse
 import logging
@@ -23,28 +22,34 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 # -------- STRATEGY CONFIG (defaults) ----------
-RISK_PCT = Decimal("0.005")          # 0.5% per trade
+RISK_PCT = Decimal("0.005")          # 0.5% per trade, matches --risk-pct 0.5
 SL_PCT = Decimal("0.0075")           # 0.75%
 TP_MULT = Decimal("3.5")
 TRAIL_TRIGGER_MULT = Decimal("1.25")
 VOL_SMA_PERIOD = 15
 RSI_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
 MAX_TRADES_PER_DAY = 3
-INTERVAL_DEFAULT = "30m"             # Changed to 30m
-ORDER_FILL_TIMEOUT = 15              # Increased to 15s
-BUY_RSI_MIN = 55
-BUY_RSI_MAX = 65
-SELL_RSI_MIN = 35
-SELL_RSI_MAX = 45
-CALLBACK_RATE_MIN = Decimal("0.1")   # Binance minimum callbackRate (percent)
-CALLBACK_RATE_MAX = Decimal("5.0")   # safety cap
-POSITION_CHECK_INTERVAL = 60         # Increased to 60s
-TRAIL_PRICE_BUFFER = Decimal("0.003")  # Increased to 0.3%
+INTERVAL_DEFAULT = "30m"
+ORDER_FILL_TIMEOUT = 15
+BUY_RSI_MIN = 50
+BUY_RSI_MAX = 70
+SELL_RSI_MIN = 30
+SELL_RSI_MAX = 50
+CALLBACK_RATE_MIN = Decimal("0.1")
+CALLBACK_RATE_MAX = Decimal("5.0")
+POSITION_CHECK_INTERVAL = 60
+TRAIL_PRICE_BUFFER = Decimal("0.003")
+KLINES_CACHE_DURATION = 5.0  # Cache klines for 5 seconds
 
 # Global stop flag and client
 STOP_REQUESTED = False
 client = None
 symbol_filters_cache = None
+klines_cache = None
+klines_cache_time = 0
 
 def _request_stop(signum, frame, symbol=None):
     global STOP_REQUESTED, client
@@ -199,7 +204,39 @@ def compute_rsi(closes, period=RSI_PERIOD):
         return 100.0
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 3)  # Increased precision to 3 decimals
+    return round(rsi, 3)
+
+def compute_macd(closes, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    if len(closes) < slow + signal:
+        return None, None, None, None
+    closes_dec = [Decimal(str(c)) for c in closes]
+    ema_fast = []
+    ema_slow = []
+    k_fast = Decimal('2') / (fast + 1)
+    k_slow = Decimal('2') / (slow + 1)
+    ema_fast.append(sum(closes_dec[:fast]) / fast)
+    ema_slow.append(sum(closes_dec[:slow]) / slow)
+    for i in range(1, len(closes_dec)):
+        if i >= fast:
+            ema_fast.append(closes_dec[i] * k_fast + ema_fast[-1] * (1 - k_fast))
+        if i >= slow:
+            ema_slow.append(closes_dec[i] * k_slow + ema_slow[-1] * (1 - k_slow))
+    if len(ema_fast) < slow - fast + 1:
+        return None, None, None, None
+    macd_line = [f - s for f, s in zip(ema_fast[-(slow - fast + 1):], ema_slow)]
+    signal_line = []
+    k_signal = Decimal('2') / (signal + 1)
+    signal_line.append(sum(macd_line[:signal]) / signal)
+    for i in range(1, len(macd_line)):
+        signal_line.append(macd_line[i] * k_signal + signal_line[-1] * (1 - k_signal))
+    macd = macd_line[-1]
+    signal_val = signal_line[-1]
+    hist = macd - signal_val
+    prev_macd = macd_line[-2] if len(macd_line) >= 2 else None
+    prev_signal = signal_line[-2] if len(signal_line) >= 2 else None
+    bullish_crossover = prev_macd and prev_signal and prev_macd <= prev_signal and macd > signal_val
+    bearish_crossover = prev_macd and prev_signal and prev_macd >= prev_signal and macd < signal_val
+    return round(float(macd), 3), round(float(signal_val), 3), bullish_crossover, bearish_crossover
 
 def sma(data, period):
     if len(data) < period:
@@ -312,8 +349,15 @@ def place_trailing_stop(client: BinanceClient, symbol: str, side: str, activatio
 
 # -------- DATA FETCHING ----------
 def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
+    global klines_cache, klines_cache_time
+    current_time = time.time()
+    if klines_cache and (current_time - klines_cache_time) < KLINES_CACHE_DURATION:
+        log("Using cached klines")
+        return klines_cache
     try:
         klines = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        klines_cache = klines
+        klines_cache_time = current_time
         return klines
     except BinanceAPIError as e:
         log(f"Klines fetch failed: {str(e)}, payload: {e.payload}")
@@ -511,7 +555,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
 
 # -------- TRADING LOOP ----------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter):
-    log(f"Starting trading loop with {timeframe} timeframe")  # Added timeframe confirmation
+    log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}")
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
@@ -576,6 +620,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 continue
 
             rsi = compute_rsi(closes)
+            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes)
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD)
             curr_vol = volumes[-1]
             close_price = Decimal(str(closes[-1]))
@@ -584,7 +629,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             is_green_candle = close_price > open_price
             is_red_candle = close_price < open_price
 
-            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
+            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd}, Signal={signal_val}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
 
             if prevent_same_bar and trade_state.exit_close_time == close_time:
                 log("Same bar as exit. Skipping to prevent re-entry.")
@@ -604,8 +649,10 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 time.sleep(1)
                 continue
 
-            buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
-            sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and (not use_volume_filter or curr_vol > vol_sma15))
+            buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
+                          bullish_crossover and (not use_volume_filter or curr_vol > vol_sma15))
+            sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and
+                           bearish_crossover and (not use_volume_filter or curr_vol > vol_sma15))
 
             if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
                 last_processed_time = close_time
@@ -881,27 +928,27 @@ def closes_and_volumes_from_klines(klines):
 
 # -------- ENTRY POINT ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Binance Futures RSI Bot (Headless, 30m Optimized, Immediate Trailing Stop, Cleaned)")
+    parser = argparse.ArgumentParser(description="Binance Futures RSI+MACD Bot (Headless, 30m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
-    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
+    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")  # Changed to SOLUSDT
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=3, help="Max trades per day (default: 3)")
-    parser.add_argument("--risk-pct", type=float, default=1.0, help="Risk percentage per trade (default: 1%)")
+    parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
     parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
     parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
     parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop (default: enabled)")
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
-    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15, default: False)")
+    parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")  # Enabled by default
     parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
     parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
 
     args = parser.parse_args()
 
     client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
-    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}")
+    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}")
 
     trading_loop(
         client=client,
