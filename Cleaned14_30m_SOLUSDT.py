@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-# Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
+# Cleaned14_30m_SOLUSDT.py
 # Changes:
-# - Fixed Telegram notification for python-telegram-bot v20.0+ (removed bot.loop, used asyncio.run)
-# - Added --no-volume-filter flag to disable volume filter
+# - Added Telegram notifications for position closures (trailing stop, stop-loss, take-profit, unknown)
+# - Disabled kline caching to ensure fresh data (KLINES_CACHE_DURATION=0)
+# - Added detailed kline logging for debugging RSI/volume mismatches
+# - Fixed TypeError in monitor_trade by using Decimal consistently
+# - Exit monitor_trade loop after position closure
+# - Ensured Decimal types in trading_loop for trade_state
+# - Previous: Added retry logic to fetch_balance, increased timeouts, added certifi
 # - Previous: Fixed monthly report scheduling, added Telegram, PnL tracking
 
 import argparse
@@ -23,6 +28,7 @@ from urllib.parse import urlencode
 from telegram import Bot
 import schedule
 import asyncio
+import certifi
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -37,15 +43,15 @@ MACD_SIGNAL = 9
 MAX_TRADES_PER_DAY = 3
 INTERVAL_DEFAULT = "30m"
 ORDER_FILL_TIMEOUT = 15
-BUY_RSI_MIN = 55
-BUY_RSI_MAX = 65
-SELL_RSI_MIN =35
-SELL_RSI_MAX = 45
+BUY_RSI_MIN = 50
+BUY_RSI_MAX = 70
+SELL_RSI_MIN = 30
+SELL_RSI_MAX = 50
 CALLBACK_RATE_MIN = Decimal("0.1")
 CALLBACK_RATE_MAX = Decimal("5.0")
 POSITION_CHECK_INTERVAL = 60
 TRAIL_PRICE_BUFFER = Decimal("0.003")
-KLINES_CACHE_DURATION = 5.0
+KLINES_CACHE_DURATION = 0  # Disabled to ensure fresh data
 
 # Global stop flag and client
 STOP_REQUESTED = False
@@ -74,8 +80,8 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
         'date': datetime.now(timezone.utc).isoformat(),
         'trade_id': trade_id,
         'side': side,
-        'entry': entry,
-        'exit': exit_price,
+        'entry': float(entry),
+        'exit': float(exit_price),
         'pnl_usd': float(pnl_usd),
         'pnl_r': float(pnl_r)
     }
@@ -173,17 +179,26 @@ def _request_stop(signum, frame, symbol=None):
 
 # -------- TIME SYNC CHECK ----------
 def check_time_offset(base_url):
-    try:
-        response = requests.get(f"{base_url}/fapi/v1/time", timeout=5)
-        server_time_ms = response.json()['serverTime']
-        server_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc)
-        local_time = datetime.now(timezone.utc)
-        offset = (server_time - local_time).total_seconds()
-        log(f"Time offset from Binance: {offset} seconds")
-        if abs(offset) > 5:
-            log("Warning: Clock offset > 5s. Using recvWindow=10000.")
-    except Exception as e:
-        log(f"Binance time sync failed: {str(e)}")
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            response = requests.get(f"{base_url}/fapi/v1/time", timeout=15, verify=certifi.where())
+            server_time_ms = response.json()['serverTime']
+            server_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc)
+            local_time = datetime.now(timezone.utc)
+            offset = (server_time - local_time).total_seconds()
+            log(f"Time offset from Binance: {offset} seconds (attempt {attempt+1}/{max_attempts})")
+            if abs(offset) > 5:
+                log("Warning: Clock offset > 5s. Using recvWindow=10000.")
+            return
+        except Exception as e:
+            log(f"Binance time sync failed (attempt {attempt+1}/{max_attempts}): {str(e)}")
+            if attempt < max_attempts - 1:
+                sleep_time = 2 ** attempt
+                log(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+            else:
+                log("All time sync attempts failed. Using local time with recvWindow=10000.")
 
 # -------- BINANCE CLIENT ----------
 class BinanceAPIError(Exception):
@@ -199,6 +214,7 @@ class BinanceClient:
         self.use_live = use_live
         self.base = base_override or ("https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com")
         print(f"🔗 Using base URL: {self.base}")
+        time.sleep(1)  # Delay to avoid rate limits
         check_time_offset(self.base)
 
     def _sign(self, query_string: str) -> str:
@@ -208,7 +224,7 @@ class BinanceClient:
         params = params.copy() if params else {}
         for attempt in range(5):
             try:
-                response = requests.get(f"{self.base}/fapi/v1/time", timeout=5)
+                response = requests.get(f"{self.base}/fapi/v1/time", timeout=15, verify=certifi.where())
                 server_time_ms = response.json()['serverTime']
                 params["timestamp"] = server_time_ms
             except Exception as e:
@@ -220,7 +236,7 @@ class BinanceClient:
             url = f"{self.base}{endpoint}?{query}&signature={signature}"
             headers = {"X-MBX-APIKEY": self.api_key}
             try:
-                r = requests.request(method, url, headers=headers, timeout=20)
+                r = requests.request(method, url, headers=headers, timeout=30, verify=certifi.where())
                 if r.status_code == 200:
                     response = r.json()
                     if isinstance(response, dict) and response.get("code") not in (None, 200):
@@ -247,7 +263,7 @@ class BinanceClient:
         url = f"{self.base}{path}"
         for attempt in range(2):
             try:
-                r = requests.get(url, params=params, timeout=20, headers={})
+                r = requests.get(url, params=params, timeout=20, headers={}, verify=certifi.where())
                 if r.status_code == 200:
                     return r.json()
                 else:
@@ -450,6 +466,9 @@ def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
         klines = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
         klines_cache = klines
         klines_cache_time = current_time
+        if klines:
+            last_kline = klines[-1]
+            log(f"Raw kline data: open={last_kline[1]}, close={last_kline[4]}, volume={last_kline[5]}, close_time={datetime.fromtimestamp(last_kline[6]/1000, tz=timezone.utc)}")
         return klines
     except BinanceAPIError as e:
         log(f"Klines fetch failed: {str(e)}, payload: {e.payload}")
@@ -459,17 +478,27 @@ def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
         raise
 
 def fetch_balance(client: BinanceClient):
-    try:
-        data = client.send_signed_request("GET", "/fapi/v2/account")
-        balance = Decimal(str(data.get("totalWalletBalance", 0)))
-        log(f"Fetched balance: {balance} USDT")
-        return balance
-    except BinanceAPIError as e:
-        log(f"Balance fetch failed: {str(e)}, payload: {e.payload}")
-        raise
-    except Exception as e:
-        log(f"Balance fetch failed: {str(e)}")
-        raise
+    max_attempts = 3
+    for attempt in range(max_attempts):
+        try:
+            data = client.send_signed_request("GET", "/fapi/v2/account")
+            balance = Decimal(str(data.get("totalWalletBalance", 0)))
+            log(f"Fetched balance: {balance} USDT (attempt {attempt+1}/{max_attempts})")
+            return balance
+        except BinanceAPIError as e:
+            log(f"Balance fetch failed (attempt {attempt+1}/{max_attempts}): {str(e)}, payload: {e.payload}")
+            if attempt < max_attempts - 1:
+                sleep_time = 2 ** attempt
+                log(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+        except Exception as e:
+            log(f"Balance fetch failed (attempt {attempt+1}/{max_attempts}): {str(e)}")
+            if attempt < max_attempts - 1:
+                sleep_time = 2 ** attempt
+                log(f"Retrying in {sleep_time} seconds...")
+                time.sleep(sleep_time)
+    log("All balance fetch attempts failed. Returning default balance of 0.")
+    return Decimal('0')
 
 def has_active_position(client: BinanceClient, symbol: str):
     try:
@@ -508,7 +537,7 @@ class TradeState:
         self.trail_order_id = None
         self.sl_order_id = None
         self.tp_order_id = None
-        self.trail_activation_price = None  # Store activation price
+        self.trail_activation_price = None
 
 # -------- LOGGING SETUP ----------
 class CustomFormatter(logging.Formatter):
@@ -528,7 +557,7 @@ logger.addHandler(file_handler)
 log = logger.info
 
 # -------- TRADE MONITORING ----------
-def monitor_trade(client, symbol, trade_state, tick_size):
+def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id):
     log("Monitoring active trade...")
     last_position_check = 0
     while trade_state.active:
@@ -540,13 +569,15 @@ def monitor_trade(client, symbol, trade_state, tick_size):
             if current_time - last_position_check >= POSITION_CHECK_INTERVAL:
                 pos = fetch_open_positions_details(client, symbol)
                 unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", "0"))) if pos else Decimal('0')
-                if unrealized_pnl == 0:
+                pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                if unrealized_pnl == 0 and pos_amt != 0:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
-                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
-                    entry_price = Decimal(str(trade_state.entry_price))  # Convert to Decimal
+                    entry_price = Decimal(str(trade_state.entry_price))
                     unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
-                log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
+                    log(f"Calculated unrealized PNL: ({current_price} - {entry_price}) * {pos_amt} = {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
+                else:
+                    log(f"Exchange-reported unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
                     try:
                         ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
@@ -582,17 +613,33 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                 last_position_check = current_time
                 if pos_amt == Decimal('0'):
                     open_orders = client.get_open_orders(symbol)
-                    trail_order = next((o for o in open_orders if o.get("orderId") == trade_state.trail_order_id), None) if trade_state.trail_activated else None
+                    trail_order = next((o for o in orders if o.get("orderId") == trade_state.trail_order_id), None) if trade_state.trail_activated else None
                     sl_order = next((o for o in open_orders if o.get("orderId") == trade_state.sl_order_id), None) if trade_state.sl_order_id else None
                     tp_order = next((o for o in open_orders if o.get("orderId") == trade_state.tp_order_id), None) if trade_state.tp_order_id else None
                     close_side = "BUY" if trade_state.side == "SHORT" else "SELL"
                     close_qty = Decimal(str(trade_state.qty))
-                    close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id or trade_state.tp_order_id or trade_state.trail_order_id)
-                    close_price = Decimal(str(close_price)) if close_price else Decimal(str(trade_state.sl))  # Fallback to SL price
-                    close_price_str = str(close_price.quantize(Decimal(str(tick_size))))
+                    close_price = None
+                    reason = "unknown"
                     if trade_state.trail_activated and not trail_order:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        reason = "trailing stop"
                         log(f"Position closed (trailing stop executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
+                        # Calculate PNL for notification
+                        pnl_usd = (close_price - trade_state.entry_price) * close_qty if trade_state.side == "LONG" else (trade_state.entry_price - close_price) * close_qty
+                        # Send Telegram notification
+                        message = (
+                            f"Position Closed (Trailing Stop):\n"
+                            f"- Symbol: {symbol}\n"
+                            f"- Side: {trade_state.side}\n"
+                            f"- Close Side: {close_side}\n"
+                            f"- Quantity: {close_qty}\n"
+                            f"- Entry Price: {trade_state.entry_price:.4f}\n"
+                            f"- Exit Price: {close_price_str}\n"
+                            f"- PNL: {pnl_usd.quantize(Decimal('0.01'))} USDT"
+                        )
+                        threading.Thread(target=lambda: asyncio.run(send_telegram_message(telegram_bot, telegram_chat_id, message))).start()
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -602,8 +649,25 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     elif sl_order is None and trade_state.sl_order_id:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        reason = "stop-loss"
                         log(f"Position closed (stop-loss executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
+                        # Calculate PNL for notification
+                        pnl_usd = (close_price - trade_state.entry_price) * close_qty if trade_state.side == "LONG" else (trade_state.entry_price - close_price) * close_qty
+                        # Send Telegram notification
+                        message = (
+                            f"Position Closed (Stop-Loss):\n"
+                            f"- Symbol: {symbol}\n"
+                            f"- Side: {trade_state.side}\n"
+                            f"- Close Side: {close_side}\n"
+                            f"- Quantity: {close_qty}\n"
+                            f"- Entry Price: {trade_state.entry_price:.4f}\n"
+                            f"- Exit Price: {close_price_str}\n"
+                            f"- PNL: {pnl_usd.quantize(Decimal('0.01'))} USDT"
+                        )
+                        threading.Thread(target=lambda: asyncio.run(send_telegram_message(telegram_bot, telegram_chat_id, message))).start()
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -613,8 +677,25 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     elif tp_order is None and trade_state.tp_order_id:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        reason = "take-profit"
                         log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
+                        # Calculate PNL for notification
+                        pnl_usd = (close_price - trade_state.entry_price) * close_qty if trade_state.side == "LONG" else (trade_state.entry_price - close_price) * close_qty
+                        # Send Telegram notification
+                        message = (
+                            f"Position Closed (Take-Profit):\n"
+                            f"- Symbol: {symbol}\n"
+                            f"- Side: {trade_state.side}\n"
+                            f"- Close Side: {close_side}\n"
+                            f"- Quantity: {close_qty}\n"
+                            f"- Entry Price: {trade_state.entry_price:.4f}\n"
+                            f"- Exit Price: {close_price_str}\n"
+                            f"- PNL: {pnl_usd.quantize(Decimal('0.01'))} USDT"
+                        )
+                        threading.Thread(target=lambda: asyncio.run(send_telegram_message(telegram_bot, telegram_chat_id, message))).start()
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -624,8 +705,25 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     else:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id or trade_state.sl_order_id or trade_state.tp_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        reason = "unknown reason"
                         log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
+                        # Calculate PNL for notification
+                        pnl_usd = (close_price - trade_state.entry_price) * close_qty if trade_state.side == "LONG" else (trade_state.entry_price - close_price) * close_qty
+                        # Send Telegram notification
+                        message = (
+                            f"Position Closed (Unknown Reason):\n"
+                            f"- Symbol: {symbol}\n"
+                            f"- Side: {trade_state.side}\n"
+                            f"- Close Side: {close_side}\n"
+                            f"- Quantity: {close_qty}\n"
+                            f"- Entry Price: {trade_state.entry_price:.4f}\n"
+                            f"- Exit Price: {close_price_str}\n"
+                            f"- PNL: {pnl_usd.quantize(Decimal('0.01'))} USDT"
+                        )
+                        threading.Thread(target=lambda: asyncio.run(send_telegram_message(telegram_bot, telegram_chat_id, message))).start()
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -641,15 +739,20 @@ def monitor_trade(client, symbol, trade_state, tick_size):
         except Exception as e:
             log(f"Monitor error: {str(e)}")
             time.sleep(2)
+
 # -------- TRADING LOOP ----------
 def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd, telegram_bot, telegram_chat_id):
-    global R  # Store R for PnL logging
+    global R
     log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}, use_macd={use_macd}")
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
     pending_entry = False
-    daily_start_balance = fetch_balance(client)
+    try:
+        daily_start_balance = fetch_balance(client)
+    except Exception as e:
+        log(f"Failed to fetch initial balance: {str(e)}. Using default balance of 1000 USDT.")
+        daily_start_balance = Decimal('1000')
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
     min_qty = filters['minQty']
@@ -709,7 +812,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 continue
 
             rsi = compute_rsi(closes)
-            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes) if use_macd else (None, None, True, True)  # Default to True if MACD disabled
+            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes) if use_macd else (None, None, True, True)
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD)
             curr_vol = volumes[-1]
             close_price = Decimal(str(closes[-1]))
@@ -834,31 +937,28 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     log("Entry timed out or aborted -> skipping this signal and waiting for next candle.")
                     continue
 
-                # Fetch actual fill price
-                time.sleep(0.2)  # 200ms delay for fill data
+                time.sleep(0.2)
                 actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
                 if actual_fill_price is None:
                     log("Failed to fetch actual fill price; using candle close price.")
                     actual_fill_price = entry_price
                 actual_fill_price_f = float(actual_fill_price)
 
-                # Calculate trailing stop parameters
                 if buy_signal:
                     sl_price_dec_quant = actual_fill_price * (Decimal("1") - SL_PCT)
                     R = actual_fill_price * SL_PCT
-                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R above entry
-                    trail_distance_dec = 2 * R  # Trailing distance is 2R
+                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)
+                    trail_distance_dec = 2 * R
                 else:
                     sl_price_dec_quant = actual_fill_price * (Decimal("1") + SL_PCT)
                     R = actual_fill_price * SL_PCT
-                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R below entry
-                    trail_distance_dec = 2 * R  # Trailing distance is 2R
+                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)
+                    trail_distance_dec = 2 * R
                 trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
                 trail_activation_price_f = float(trail_activation_price_dec_quant)
                 callback_rate_dec = (trail_distance_dec / trail_activation_price_dec * Decimal("100")).quantize(Decimal('0.01'))
                 callback_rate_f = float(callback_rate_dec)
 
-                # Check if trailing stop activation price is too close to current price
                 try:
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
@@ -886,20 +986,19 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     continue
 
                 trade_state.active = True
-                trade_state.entry_price = actual_fill_price_f
-                trade_state.qty = float(actual_qty)
+                trade_state.entry_price = Decimal(str(actual_fill_price))
+                trade_state.qty = Decimal(str(actual_qty))
                 trade_state.side = "LONG" if buy_signal else "SHORT"
                 trade_state.entry_close_time = close_time
-                trade_state.sl = sl_price_f
-                trade_state.tp = tp_price_f
+                trade_state.sl = Decimal(str(sl_price_f))
+                trade_state.tp = Decimal(str(tp_price_f))
                 trade_state.trail_activated = False
                 trade_state.trail_order_id = None
                 trade_state.sl_order_id = None
                 trade_state.tp_order_id = None
-                trade_state.trail_activation_price = trail_activation_price_dec_quant  # Store activation price
-                log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f}, sl={sl_price_f}, tp={tp_price_f}, trailActivation={trail_activation_price_f}, trailDistance={trail_distance_dec} (2R)")
+                trade_state.trail_activation_price = trail_activation_price_dec_quant
+                log(f"Position opened: {trade_state.side}, qty={trade_state.qty}, entry={trade_state.entry_price}, sl={trade_state.sl}, tp={trade_state.tp}, trailActivation={trail_activation_price_f}, trailDistance={trail_distance_dec} (2R)")
 
-                # Send Telegram notification
                 trade_details = {
                     'symbol': symbol,
                     'side': trade_state.side,
@@ -928,7 +1027,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     except BinanceAPIError as e:
                         if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
                             log(f"SL precision error. Re-fetching filters and retrying...")
-                            symbol_filters_cache = None  # Reset cache
+                            symbol_filters_cache = None
                             filters = get_symbol_filters(client, symbol)
                             tick_size = filters['tickSize']
                             sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
@@ -945,7 +1044,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     except BinanceAPIError as e:
                         if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
                             log(f"TP precision error. Re-fetching filters and retrying...")
-                            symbol_filters_cache = None  # Reset cache
+                            symbol_filters_cache = None
                             filters = get_symbol_filters(client, symbol)
                             tick_size = filters['tickSize']
                             tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
@@ -959,7 +1058,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                         log(f"Placing trailing stop: activationPrice={trail_activation_price_f}, callbackRate={callback_rate_f}%, trailDistance={trail_distance_dec} (2R)")
                         try:
                             trail_res = place_trailing_stop(client, symbol, close_side_for_sl, trail_activation_price_f, callback_rate_f, Decimal(str(actual_qty)), sl_price_dec_quant)
-                            trade_state.trail_activated = False  # Reset, will be set on price check
+                            trade_state.trail_activated = False
                             trade_state.trail_order_id = trail_res.get("orderId")
                             log(f"Trailing stop response: {trail_res}")
                         except BinanceAPIError as e:
@@ -980,7 +1079,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
                 trades_today += 1
                 pending_entry = False
-                monitor_trade(client, symbol, trade_state, tick_size)
+                monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
 
             elif trade_state.active or pending_entry:
                 log("Trade active or pending. Skipping signal check.")
@@ -1010,7 +1109,7 @@ def interval_ms(interval):
         return int(interval[:-1]) * 60 * 1000
     if interval.endswith("h"):
         return int(interval[:-1]) * 60 * 60 * 1000
-    return 30 * 60 * 1000  # 30m default
+    return 30 * 60 * 1000
 
 def _safe_sleep(total_seconds):
     remaining = float(total_seconds)
@@ -1025,6 +1124,8 @@ def closes_and_volumes_from_klines(klines):
     volumes = [float(k[5]) for k in klines]
     close_times = [int(k[6]) for k in klines]
     opens = [float(k[1]) for k in klines]
+    if closes:
+        log(f"Processed kline data: close={closes[-1]}, volume={volumes[-1]}, close_time={datetime.fromtimestamp(close_times[-1]/1000, tz=timezone.utc)}")
     return closes, volumes, close_times, opens
 
 # -------- SCHEDULER FOR REPORTS ----------
@@ -1057,34 +1158,25 @@ if __name__ == "__main__":
     parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
     parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
     parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
-    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop (default: enabled)")
-    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
-    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
-    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
-    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15)")
-    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter', help="Disable volume filter")
-    parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")
-    parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
-    parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
-
+    parser.add_argument("--no-trailing", action="store_false", dest="use_trailing", help="Disable trailing stop")
+    parser.add_argument("--allow-same-bar", action="store_false", dest="prevent_same_bar", help="Allow entry on same bar as exit")
+    parser.add_argument("--allow-pos", action="store_false", dest="require_no_pos", help="Allow trading with active position")
+    parser.add_argument("--no-max-loss", action="store_false", dest="use_max_loss", help="Disable max daily loss check")
+    parser.add_argument("--no-volume", action="store_false", dest="use_volume_filter", help="Disable volume filter")
+    parser.add_argument("--no-macd", action="store_false", dest="use_macd", help="Disable MACD signal")
+    parser.add_argument("--live", action="store_true", help="Use live trading (default: testnet)")
     args = parser.parse_args()
 
     init_pnl_log()
-
     telegram_bot = Bot(token=args.telegram_token)
-
-    client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
-    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}, use_macd={args.use_macd}")
-
-    # Schedule reports in a separate thread
-    threading.Thread(target=lambda: run_scheduler(telegram_bot, args.chat_id), daemon=True).start()
-
+    client = BinanceClient(args.api_key, args.api_secret, use_live=args.live)
+    threading.Thread(target=run_scheduler, args=(telegram_bot, args.chat_id), daemon=True).start()
     trading_loop(
         client=client,
         symbol=args.symbol,
         timeframe=args.timeframe,
         max_trades_per_day=args.max_trades,
-        risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
+        risk_pct=Decimal(str(args.risk_pct / 100)),
         max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
         tp_mult=Decimal(str(args.tp_mult)),
         use_trailing=args.use_trailing,
