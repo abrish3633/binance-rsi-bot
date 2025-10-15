@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
-# Changes from previous version:
-# - Changed --use-macd default from True to False to disable MACD confirmation by default
-# - Retained SOLUSDT, 0.5% risk, volume filter enabled, 30m timeframe optimizations
-# - Previous changes: Added --use-macd flag, updated trading_loop and logging
+# Changes:
+# - Added Telegram notifications for trade entries and daily/weekly/monthly PnL reports
+# - Integrated schedule library for recurring tasks
+# - PnL tracking via CSV file ('pnl_log.csv')
+# - Added --telegram-token and --chat-id args
+# - Previous: --use-macd default=False
 
 import argparse
 import logging
@@ -15,9 +17,13 @@ import os
 import signal
 import sys
 import statistics
+import csv
+import threading
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
 from datetime import datetime, timezone
 from urllib.parse import urlencode
+from telegram import Bot
+import schedule
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -40,7 +46,7 @@ CALLBACK_RATE_MIN = Decimal("0.1")
 CALLBACK_RATE_MAX = Decimal("5.0")
 POSITION_CHECK_INTERVAL = 60
 TRAIL_PRICE_BUFFER = Decimal("0.003")
-KLINES_CACHE_DURATION = 5.0  # Cache klines for 5 seconds
+KLINES_CACHE_DURATION = 5.0
 
 # Global stop flag and client
 STOP_REQUESTED = False
@@ -48,6 +54,95 @@ client = None
 symbol_filters_cache = None
 klines_cache = None
 klines_cache_time = 0
+
+# Global PnL tracking
+PNL_LOG_FILE = 'pnl_log.csv'
+pnl_data = []  # List of dicts: {'date': str, 'trade_id': int, 'side': str, 'entry': float, 'exit': float, 'pnl_usd': float, 'pnl_r': float}
+
+def init_pnl_log():
+    if not os.path.exists(PNL_LOG_FILE):
+        with open(PNL_LOG_FILE, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r'])
+            writer.writeheader()
+
+def log_pnl(trade_id, side, entry, exit_price, qty, R):
+    if side == 'LONG':
+        pnl_usd = (exit_price - entry) * qty
+    else:
+        pnl_usd = (entry - exit_price) * qty
+    pnl_r = pnl_usd / R if R > 0 else 0
+    row = {
+        'date': datetime.now(timezone.utc).isoformat(),
+        'trade_id': trade_id,
+        'side': side,
+        'entry': entry,
+        'exit': exit_price,
+        'pnl_usd': float(pnl_usd),
+        'pnl_r': float(pnl_r)
+    }
+    pnl_data.append(row)
+    with open(PNL_LOG_FILE, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=row.keys())
+        writer.writerow(row)
+
+def calculate_pnl_report(period='daily'):
+    if not pnl_data:
+        return "No trades recorded."
+    from datetime import timedelta
+    end_date = datetime.now(timezone.utc)
+    if period == 'daily':
+        start_date = end_date - timedelta(days=1)
+    elif period == 'weekly':
+        start_date = end_date - timedelta(weeks=1)
+    elif period == 'monthly':
+        start_date = end_date - timedelta(days=30)  # Approximate
+    else:
+        return "Invalid period."
+    period_trades = [trade for trade in pnl_data if datetime.fromisoformat(trade['date']) >= start_date]
+    if not period_trades:
+        return f"No trades in {period} period."
+    total_pnl_usd = sum(trade['pnl_usd'] for trade in period_trades)
+    total_pnl_r = sum(trade['pnl_r'] for trade in period_trades)
+    num_trades = len(period_trades)
+    wins = len([t for t in period_trades if t['pnl_r'] > 0])
+    win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
+    report = f"{period.capitalize()} PnL Report:\n- Trades: {num_trades}\n- Win Rate: {win_rate:.2f}%\n- Total PnL: ${total_pnl_usd:.2f}\n- Total PnL: {total_pnl_r:.2f}R"
+    return report
+
+async def send_telegram_message(bot, chat_id, message):
+    try:
+        await bot.send_message(chat_id=chat_id, text=message)
+        log(f"Telegram message sent: {message[:50]}...")
+    except Exception as e:
+        log(f"Telegram send failed: {str(e)}")
+
+def send_trade_telegram(trade_details, bot, chat_id):
+    message = (
+        f"New Trade Entry:\n"
+        f"- Symbol: {trade_details['symbol']}\n"
+        f"- Side: {trade_details['side']}\n"
+        f"- Entry Price: {trade_details['entry']:.4f}\n"
+        f"- SL: {trade_details['sl']:.4f}\n"
+        f"- TP: {trade_details['tp']:.4f}\n"
+        f"- Trailing Activation: {trade_details['trail_activation']:.4f}\n"
+        f"- Qty: {trade_details['qty']}"
+    )
+    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, message))).start()
+
+def send_daily_report(bot, chat_id):
+    report = calculate_pnl_report('daily')
+    subject = f"Daily PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
+
+def send_weekly_report(bot, chat_id):
+    report = calculate_pnl_report('weekly')
+    subject = f"Weekly PnL Report - Week of {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
+
+def send_monthly_report(bot, chat_id):
+    report = calculate_pnl_report('monthly')
+    subject = f"Monthly PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m')}"
+    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
 def _request_stop(signum, frame, symbol=None):
     global STOP_REQUESTED, client
@@ -499,6 +594,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                         close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
                         close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (trailing stop executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -511,6 +607,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                         close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
                         close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (stop-loss executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -523,6 +620,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                         close_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
                         close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -535,6 +633,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                         close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id or trade_state.sl_order_id or trade_state.tp_order_id)
                         close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -552,7 +651,8 @@ def monitor_trade(client, symbol, trade_state, tick_size):
             time.sleep(2)
 
 # -------- TRADING LOOP ----------
-def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd):
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd, telegram_bot, telegram_chat_id):
+    global R  # Store R for PnL logging
     log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}, use_macd={use_macd}")
     trades_today = 0
     last_processed_time = 0
@@ -808,6 +908,18 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 trade_state.trail_activation_price = trail_activation_price_dec_quant  # Store activation price
                 log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f}, sl={sl_price_f}, tp={tp_price_f}, trailActivation={trail_activation_price_f}, trailDistance={trail_distance_dec} (2R)")
 
+                # Send Telegram notification
+                trade_details = {
+                    'symbol': symbol,
+                    'side': trade_state.side,
+                    'entry': trade_state.entry_price,
+                    'sl': trade_state.sl,
+                    'tp': trade_state.tp,
+                    'trail_activation': trade_state.trail_activation_price,
+                    'qty': trade_state.qty
+                }
+                send_trade_telegram(trade_details, telegram_bot, telegram_chat_id)
+
                 try:
                     log("Cancelling all existing open orders for symbol before placing SL/TP...")
                     try:
@@ -929,6 +1041,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI+MACD Bot (Headless, 30m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
+    parser.add_argument("--telegram-token", required=True, help="Telegram Bot Token")
+    parser.add_argument("--chat-id", required=True, help="Telegram Chat ID")
     parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=3, help="Max trades per day (default: 3)")
@@ -940,14 +1054,29 @@ if __name__ == "__main__":
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
     parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")
-    parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")  # Changed default to False
+    parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")
     parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
     parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
 
     args = parser.parse_args()
 
+    init_pnl_log()
+
+    telegram_bot = Bot(token=args.telegram_token)
+
     client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
     log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}, use_macd={args.use_macd}")
+
+    # Schedule reports in a separate thread
+    def run_scheduler():
+        schedule.every().day.at("23:59").do(lambda: send_daily_report(telegram_bot, args.chat_id))
+        schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(telegram_bot, args.chat_id))
+        schedule.every().month.do(lambda: send_monthly_report(telegram_bot, args.chat_id))
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
+
+    threading.Thread(target=run_scheduler, daemon=True).start()
 
     trading_loop(
         client=client,
@@ -962,5 +1091,7 @@ if __name__ == "__main__":
         require_no_pos=args.require_no_pos,
         use_max_loss=args.use_max_loss,
         use_volume_filter=args.use_volume_filter,
-        use_macd=args.use_macd
+        use_macd=args.use_macd,
+        telegram_bot=telegram_bot,
+        telegram_chat_id=args.chat_id
     )
