@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 # Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
 # Changes:
-# - Added Telegram notifications for trade entries and daily/weekly/monthly PnL reports
-# - Integrated schedule library for recurring tasks
-# - PnL tracking via CSV file ('pnl_log.csv')
-# - Added --telegram-token and --chat-id args
-# - Previous: --use-macd default=False
+# - Fixed run_scheduler: Replaced invalid 'month' with daily check for first day of month
+# - Previous: Added Telegram notifications, PnL tracking via CSV, schedule library
 
 import argparse
 import logging
@@ -526,7 +523,6 @@ logger.addHandler(console_handler)
 file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(file_handler)
-
 log = logger.info
 
 # -------- TRADE MONITORING ----------
@@ -1036,6 +1032,23 @@ def closes_and_volumes_from_klines(klines):
     opens = [float(k[1]) for k in klines]
     return closes, volumes, close_times, opens
 
+# -------- SCHEDULER FOR REPORTS ----------
+def run_scheduler(bot, chat_id):
+    last_month = None
+    def check_monthly_report():
+        nonlocal last_month
+        current_date = datetime.now(timezone.utc)
+        if current_date.day == 1 and (last_month is None or current_date.month != last_month):
+            send_monthly_report(bot, chat_id)
+            last_month = current_date.month
+
+    schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
+    schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
+    schedule.every().day.at("00:00").do(check_monthly_report)
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
 # -------- ENTRY POINT ----------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI+MACD Bot (Headless, 30m Optimized, SOLUSDT)")
@@ -1068,15 +1081,7 @@ if __name__ == "__main__":
     log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}, use_macd={args.use_macd}")
 
     # Schedule reports in a separate thread
-    def run_scheduler():
-        schedule.every().day.at("23:59").do(lambda: send_daily_report(telegram_bot, args.chat_id))
-        schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(telegram_bot, args.chat_id))
-        schedule.every().month.do(lambda: send_monthly_report(telegram_bot, args.chat_id))
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=lambda: run_scheduler(telegram_bot, args.chat_id), daemon=True).start()
 
     trading_loop(
         client=client,
