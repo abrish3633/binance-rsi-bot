@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
-# Changes from previous Cleaned14_30m_SOLUSDT.py:
-# - Added --use-macd flag (default: True) to make MACD optional, like --use-volume-filter
-# - Updated trading_loop to use args.use_macd in signal logic
-# - Added use_macd to startup log
+# Changes from previous version:
+# - Changed --use-macd default from True to False to disable MACD confirmation by default
 # - Retained SOLUSDT, 0.5% risk, volume filter enabled, 30m timeframe optimizations
+# - Previous changes: Added --use-macd flag, updated trading_loop and logging
 
 import argparse
 import logging
@@ -307,7 +306,7 @@ def place_trailing_stop(client: BinanceClient, symbol: str, side: str, activatio
         activation_price_quant + trail_distance if side == "BUY" else activation_price_quant - trail_distance,
         tick_size
     )
-    log(f"Trailing stop setup: activationPrice={activation_price_quant}, trailDistance={trail_distance} (2R), initialStopPrice={initial_stop_price}, callbackRate={callback_rate_dec}%, tickSize={tick_size}")
+    log(f"Trailing stop setup: activationPrice={activation_price_quant}, trailDistance={trail_distance} (2R), initialStopPrice={initial_stop_price}, callbackRate={callback_rate_dec}%")
     params = {
         "symbol": symbol,
         "side": side,
@@ -941,7 +940,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
     parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")
-    parser.add_argument("--use-macd", action='store_true', default=True, help="Use MACD confirmation (default: True)")  # Added use-macd flag
+    parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")  # Changed default to False
     parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
     parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
 
@@ -963,5 +962,5 @@ if __name__ == "__main__":
         require_no_pos=args.require_no_pos,
         use_max_loss=args.use_max_loss,
         use_volume_filter=args.use_volume_filter,
-        use_macd=args.use_macd  # Pass use_macd to trading_loop
+        use_macd=args.use_macd
     )
