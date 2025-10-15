@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
-# Changes from Cleaned14_30m.py:
-# - Changed default symbol to SOLUSDT
-# - Enabled use-volume-filter by default
-# - Added startup log for default parameters
-# - Retained 30m timeframe optimizations and MACD confirmation
-# - Risk-pct 0.5% already matched (RISK_PCT = 0.005)
+# Changes from previous Cleaned14_30m_SOLUSDT.py:
+# - Added --use-macd flag (default: True) to make MACD optional, like --use-volume-filter
+# - Updated trading_loop to use args.use_macd in signal logic
+# - Added use_macd to startup log
+# - Retained SOLUSDT, 0.5% risk, volume filter enabled, 30m timeframe optimizations
 
 import argparse
 import logging
@@ -22,7 +21,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 # -------- STRATEGY CONFIG (defaults) ----------
-RISK_PCT = Decimal("0.005")          # 0.5% per trade, matches --risk-pct 0.5
+RISK_PCT = Decimal("0.005")          # 0.5% per trade
 SL_PCT = Decimal("0.0075")           # 0.75%
 TP_MULT = Decimal("3.5")
 TRAIL_TRIGGER_MULT = Decimal("1.25")
@@ -554,8 +553,8 @@ def monitor_trade(client, symbol, trade_state, tick_size):
             time.sleep(2)
 
 # -------- TRADING LOOP ----------
-def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter):
-    log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}")
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd):
+    log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}, use_macd={use_macd}")
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
@@ -620,7 +619,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 continue
 
             rsi = compute_rsi(closes)
-            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes)
+            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes) if use_macd else (None, None, True, True)  # Default to True if MACD disabled
             vol_sma15 = sma(volumes, VOL_SMA_PERIOD)
             curr_vol = volumes[-1]
             close_price = Decimal(str(closes[-1]))
@@ -629,7 +628,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             is_green_candle = close_price > open_price
             is_red_candle = close_price < open_price
 
-            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd}, Signal={signal_val}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
+            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd if use_macd else 'N/A'}, Signal={signal_val if use_macd else 'N/A'}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
 
             if prevent_same_bar and trade_state.exit_close_time == close_time:
                 log("Same bar as exit. Skipping to prevent re-entry.")
@@ -650,9 +649,9 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 continue
 
             buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
-                          bullish_crossover and (not use_volume_filter or curr_vol > vol_sma15))
+                          (not use_macd or bullish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
             sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and
-                           bearish_crossover and (not use_volume_filter or curr_vol > vol_sma15))
+                           (not use_macd or bearish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
 
             if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
                 last_processed_time = close_time
@@ -931,7 +930,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures RSI+MACD Bot (Headless, 30m Optimized, SOLUSDT)")
     parser.add_argument("--api-key", required=True, help="Binance API Key")
     parser.add_argument("--api-secret", required=True, help="Binance API Secret")
-    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")  # Changed to SOLUSDT
+    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=3, help="Max trades per day (default: 3)")
     parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
@@ -941,14 +940,15 @@ if __name__ == "__main__":
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
-    parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")  # Enabled by default
+    parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")
+    parser.add_argument("--use-macd", action='store_true', default=True, help="Use MACD confirmation (default: True)")  # Added use-macd flag
     parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
     parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
 
     args = parser.parse_args()
 
     client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
-    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}")
+    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}, use_macd={args.use_macd}")
 
     trading_loop(
         client=client,
@@ -962,5 +962,6 @@ if __name__ == "__main__":
         prevent_same_bar=args.prevent_same_bar,
         require_no_pos=args.require_no_pos,
         use_max_loss=args.use_max_loss,
-        use_volume_filter=args.use_volume_filter
+        use_volume_filter=args.use_volume_filter,
+        use_macd=args.use_macd  # Pass use_macd to trading_loop
     )
