@@ -8,6 +8,7 @@
 # - Exit monitor_trade loop after position closure
 # - Ensured Decimal types in trading_loop for trade_state
 # - Initialized last_processed_time to fix loop error
+# - Moved logging setup to top to fix NameError in check_time_offset
 # - Previous: Added retry logic to fetch_balance, increased timeouts, added certifi
 # - Previous: Fixed monthly report scheduling, added Telegram, PnL tracking
 
@@ -30,6 +31,12 @@ from telegram import Bot
 import schedule
 import asyncio
 import certifi
+
+# -------- LOGGING SETUP ----------
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+def log(msg):
+    logger.info(msg)
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -764,6 +771,8 @@ def run_scheduler(bot, chat_id):
     while True:
         schedule.run_pending()
         time.sleep(60)
+
+# -------- ENTRY POINT ----------
 
 # -------- ENTRY POINT ----------
 if __name__ == "__main__":
