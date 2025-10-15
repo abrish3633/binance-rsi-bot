@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
 # Changes:
-# - Fixed run_scheduler: Replaced invalid 'month' with daily check for first day of month
-# - Previous: Added Telegram notifications, PnL tracking via CSV, schedule library
+# - Fixed Telegram notification for python-telegram-bot v20.0+ (removed bot.loop, used asyncio.run)
+# - Added --no-volume-filter flag to disable volume filter
+# - Previous: Fixed monthly report scheduling, added Telegram, PnL tracking
 
 import argparse
 import logging
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from telegram import Bot
 import schedule
+import asyncio
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -35,10 +37,10 @@ MACD_SIGNAL = 9
 MAX_TRADES_PER_DAY = 3
 INTERVAL_DEFAULT = "30m"
 ORDER_FILL_TIMEOUT = 15
-BUY_RSI_MIN = 55
-BUY_RSI_MAX = 65
-SELL_RSI_MIN = 35
-SELL_RSI_MAX = 45
+BUY_RSI_MIN = 50
+BUY_RSI_MAX = 70
+SELL_RSI_MIN = 30
+SELL_RSI_MAX = 50
 CALLBACK_RATE_MIN = Decimal("0.1")
 CALLBACK_RATE_MAX = Decimal("5.0")
 POSITION_CHECK_INTERVAL = 60
@@ -124,22 +126,22 @@ def send_trade_telegram(trade_details, bot, chat_id):
         f"- Trailing Activation: {trade_details['trail_activation']:.4f}\n"
         f"- Qty: {trade_details['qty']}"
     )
-    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, message))).start()
+    threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, message))).start()
 
 def send_daily_report(bot, chat_id):
     report = calculate_pnl_report('daily')
     subject = f"Daily PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
-    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
+    threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
 def send_weekly_report(bot, chat_id):
     report = calculate_pnl_report('weekly')
     subject = f"Weekly PnL Report - Week of {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
-    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
+    threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
 def send_monthly_report(bot, chat_id):
     report = calculate_pnl_report('monthly')
     subject = f"Monthly PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m')}"
-    threading.Thread(target=lambda: bot.loop.run_until_complete(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
+    threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
 def _request_stop(signum, frame, symbol=None):
     global STOP_REQUESTED, client
@@ -1066,7 +1068,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
     parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
     parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
-    parser.add_argument("--use-volume-filter", action='store_true', default=True, help="Use volume filter (vol > SMA15, default: True)")
+    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15)")
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter', help="Disable volume filter")
     parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")
     parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
     parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
