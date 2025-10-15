@@ -480,13 +480,22 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 time.sleep(1)
                 continue
 
-            # Debug raw kline closes
-            raw_closes = [float(k[4]) for k in klines[-RSI_PERIOD:]] if len(klines) >= RSI_PERIOD else []
-            log(f"Raw closes for RSI (last {RSI_PERIOD} periods): {raw_closes}")
-            rsi = statistics.mean(raw_closes) if raw_closes else None
-            if rsi and (rsi < 0 or rsi > 100):
-                log(f"Warning: Abnormal RSI {rsi} detected. Skipping trade signal.")
-                rsi = None  # Invalidate RSI for this cycle
+            # Calculate RSI
+            raw_closes = [float(k[4]) for k in klines[-RSI_PERIOD-1:]] if len(klines) > RSI_PERIOD else []
+            log(f"Raw closes for RSI (last {RSI_PERIOD+1} periods): {raw_closes}")
+            if len(raw_closes) > 1:
+                price_changes = [raw_closes[i] - raw_closes[i-1] for i in range(1, len(raw_closes))]
+                gains = [max(0, change) for change in price_changes]
+                losses = [-min(0, change) for change in price_changes]
+                avg_gain = statistics.mean(gains) if gains else 0
+                avg_loss = statistics.mean(losses) if losses else 0
+                rs = avg_gain / avg_loss if avg_loss > 0 else 0 if avg_gain == 0 else float('inf')
+                rsi = 100 - (100 / (1 + rs)) if avg_loss > 0 else 100 if avg_gain == 0 else 0
+                log(f"RSI calculation: avg_gain={avg_gain}, avg_loss={avg_loss}, RS={rs}, RSI={rsi}")
+            else:
+                rsi = None
+                log("Insufficient data for RSI calculation.")
+
             macd_fast = statistics.mean([float(k[4]) for k in klines[-MACD_FAST:]]) if len(klines) >= MACD_FAST else None
             macd_slow = statistics.mean([float(k[4]) for k in klines[-MACD_SLOW:]]) if len(klines) >= MACD_SLOW else None
             macd_signal = statistics.mean([macd_fast - macd_slow for _ in range(MACD_SIGNAL)]) if macd_fast and macd_slow and len(klines) >= MACD_SLOW + MACD_SIGNAL else None
@@ -736,7 +745,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             time.sleep(2)
 
     log("Trading loop exited.")
-    
+
 def interval_ms(interval):
     if interval.endswith("m"):
         return int(interval[:-1]) * 60 * 1000
