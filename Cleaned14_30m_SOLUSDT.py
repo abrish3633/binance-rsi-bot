@@ -544,7 +544,7 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                     ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
                     current_price = Decimal(str(ticker.get("price")))
                     pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
-                    entry_price = Decimal(str(trade_state.entry_price))
+                    entry_price = Decimal(str(trade_state.entry_price))  # Convert to Decimal
                     unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
                 log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
                 if not trade_state.trail_activated and trade_state.trail_activation_price:
@@ -587,12 +587,12 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                     tp_order = next((o for o in open_orders if o.get("orderId") == trade_state.tp_order_id), None) if trade_state.tp_order_id else None
                     close_side = "BUY" if trade_state.side == "SHORT" else "SELL"
                     close_qty = Decimal(str(trade_state.qty))
-                    close_price = None
+                    close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id or trade_state.tp_order_id or trade_state.trail_order_id)
+                    close_price = Decimal(str(close_price)) if close_price else Decimal(str(trade_state.sl))  # Fallback to SL price
+                    close_price_str = str(close_price.quantize(Decimal(str(tick_size))))
                     if trade_state.trail_activated and not trail_order:
-                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
-                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (trailing stop executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -602,10 +602,8 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     elif sl_order is None and trade_state.sl_order_id:
-                        close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
-                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (stop-loss executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -615,10 +613,8 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     elif tp_order is None and trade_state.tp_order_id:
-                        close_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
-                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
@@ -628,10 +624,8 @@ def monitor_trade(client, symbol, trade_state, tick_size):
                             log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
                         return
                     else:
-                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id or trade_state.sl_order_id or trade_state.tp_order_id)
-                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
                         log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
-                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price), close_qty, R)
                         trade_state.active = False
                         trade_state.exit_close_time = int(current_time * 1000)
                         try:
