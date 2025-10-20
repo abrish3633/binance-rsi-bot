@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-# Enhanced Binance Futures Trading Bot
-# - Optimized for SOLUSDT on 30m timeframe
-# - Uses RSI, MACD, volume filters for signals
-# - Risk management with SL, TP, trailing stops
-# - Telegram notifications for entries, exits, and reports
-# - PnL tracking and periodic reports
-# - Graceful shutdown with position closure
-# - Improved indicator calculations using proper EMA for MACD and Wilder's RSI
-# - Consistent use of Decimal for precision
-# - Optimized API calls (public endpoints without signing)
-# - Enhanced error handling and retries
-# - Daily loss and trade count reset
-# - Exact exit price from user trades
-# - Leverage setting
-# - PEP8 compliant, with docstrings and type hints
+# Last_Gptmodgrok_Impotis3_Mod_Hedless2MergedTrailfixed14_30m_SOLUSDT_Cleaned14_30m_SOLUSDT.py
+# Changes:
+# - Fixed Telegram notification for python-telegram-bot v20.0+ (removed bot.loop, used asyncio.run)
+# - Added --no-volume-filter flag to disable volume filter
+# - Previous: Fixed monthly report scheduling, added Telegram, PnL tracking
 
 import argparse
 import logging
@@ -27,22 +17,12 @@ import sys
 import statistics
 import csv
 import threading
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from datetime import datetime, timezone, timedelta, date
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 from telegram import Bot
 import schedule
 import asyncio
-import certifi
-from typing import Dict, List, Optional, Tuple
-
-# -------- LOGGING SETUP ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -64,35 +44,38 @@ SELL_RSI_MAX = 50
 CALLBACK_RATE_MIN = Decimal("0.1")
 CALLBACK_RATE_MAX = Decimal("5.0")
 POSITION_CHECK_INTERVAL = 60
-KLINES_CACHE_DURATION = 0  # Disabled for fresh data
-KLINES_LIMIT = 200  # For accurate indicators
+TRAIL_PRICE_BUFFER = Decimal("0.003")
+KLINES_CACHE_DURATION = 5.0
 
-# Global flags and variables
+# Global stop flag and client
 STOP_REQUESTED = False
-TRADE_ID_COUNTER = 0
-PNL_LOG_FILE = 'pnl_log.csv'
-pnl_data: List[Dict[str, any]] = []  # For in-memory PnL reports
+client = None
+symbol_filters_cache = None
+klines_cache = None
+klines_cache_time = 0
 
-def init_pnl_log() -> None:
-    """Initialize PnL log CSV if it doesn't exist."""
+# Global PnL tracking
+PNL_LOG_FILE = 'pnl_log.csv'
+pnl_data = []  # List of dicts: {'date': str, 'trade_id': int, 'side': str, 'entry': float, 'exit': float, 'pnl_usd': float, 'pnl_r': float}
+
+def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
         with open(PNL_LOG_FILE, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r'])
             writer.writeheader()
 
-def log_pnl(trade_id: int, side: str, entry: Decimal, exit_price: Decimal, qty: Decimal, r: Decimal) -> None:
-    """Log PnL for a closed trade to CSV and in-memory list."""
+def log_pnl(trade_id, side, entry, exit_price, qty, R):
     if side == 'LONG':
         pnl_usd = (exit_price - entry) * qty
     else:
         pnl_usd = (entry - exit_price) * qty
-    pnl_r = pnl_usd / r if r > 0 else Decimal('0')
+    pnl_r = pnl_usd / R if R > 0 else 0
     row = {
         'date': datetime.now(timezone.utc).isoformat(),
         'trade_id': trade_id,
         'side': side,
-        'entry': float(entry),
-        'exit': float(exit_price),
+        'entry': entry,
+        'exit': exit_price,
         'pnl_usd': float(pnl_usd),
         'pnl_r': float(pnl_r)
     }
@@ -100,28 +83,11 @@ def log_pnl(trade_id: int, side: str, entry: Decimal, exit_price: Decimal, qty: 
     with open(PNL_LOG_FILE, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=row.keys())
         writer.writerow(row)
-    logger.info(f"PnL logged for trade {trade_id}: {pnl_usd:.2f} USD ({pnl_r:.2f}R)")
 
-def get_pnl_total_usd(period: str = 'daily') -> float:
-    """Get total PnL USD for the specified period."""
-    if not pnl_data:
-        return 0.0
-    end_date = datetime.now(timezone.utc)
-    if period == 'daily':
-        start_date = end_date - timedelta(days=1)
-    elif period == 'weekly':
-        start_date = end_date - timedelta(weeks=1)
-    elif period == 'monthly':
-        start_date = end_date - timedelta(days=30)  # Approximate
-    else:
-        raise ValueError("Invalid period.")
-    period_trades = [trade for trade in pnl_data if datetime.fromisoformat(trade['date']) >= start_date]
-    return sum(trade['pnl_usd'] for trade in period_trades)
-
-def calculate_pnl_report(period: str = 'daily') -> str:
-    """Generate PnL report for the specified period."""
+def calculate_pnl_report(period='daily'):
     if not pnl_data:
         return "No trades recorded."
+    from datetime import timedelta
     end_date = datetime.now(timezone.utc)
     if period == 'daily':
         start_date = end_date - timedelta(days=1)
@@ -139,27 +105,19 @@ def calculate_pnl_report(period: str = 'daily') -> str:
     num_trades = len(period_trades)
     wins = len([t for t in period_trades if t['pnl_r'] > 0])
     win_rate = (wins / num_trades * 100) if num_trades > 0 else 0
-    report = (
-        f"{period.capitalize()} PnL Report:\n"
-        f"- Trades: {num_trades}\n"
-        f"- Win Rate: {win_rate:.2f}%\n"
-        f"- Total PnL: ${total_pnl_usd:.2f}\n"
-        f"- Total PnL: {total_pnl_r:.2f}R"
-    )
+    report = f"{period.capitalize()} PnL Report:\n- Trades: {num_trades}\n- Win Rate: {win_rate:.2f}%\n- Total PnL: ${total_pnl_usd:.2f}\n- Total PnL: {total_pnl_r:.2f}R"
     return report
 
-async def send_telegram_message(bot: Bot, chat_id: str, message: str) -> None:
-    """Asynchronously send a message via Telegram."""
+async def send_telegram_message(bot, chat_id, message):
     try:
         await bot.send_message(chat_id=chat_id, text=message)
-        logger.info(f"Telegram message sent: {message[:50]}...")
+        log(f"Telegram message sent: {message[:50]}...")
     except Exception as e:
-        logger.error(f"Telegram send failed: {str(e)}")
+        log(f"Telegram send failed: {str(e)}")
 
-def send_entry_telegram(trade_details: Dict[str, any], bot: Bot, chat_id: str) -> None:
-    """Send Telegram notification for new trade entry."""
+def send_trade_telegram(trade_details, bot, chat_id):
     message = (
-        f"New Trade Entry (ID: {trade_details['trade_id']}):\n"
+        f"New Trade Entry:\n"
         f"- Symbol: {trade_details['symbol']}\n"
         f"- Side: {trade_details['side']}\n"
         f"- Entry Price: {trade_details['entry']:.4f}\n"
@@ -170,727 +128,971 @@ def send_entry_telegram(trade_details: Dict[str, any], bot: Bot, chat_id: str) -
     )
     threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, message))).start()
 
-def send_exit_telegram(symbol: str, trade_id: int, side: str, exit_price: float, qty: float, reason: str, bot: Bot, chat_id: str) -> None:
-    """Send Telegram notification for trade exit."""
-    message = (
-        f"Trade Exit (ID: {trade_id}):\n"
-        f"- Symbol: {symbol}\n"
-        f"- Side: {side}\n"
-        f"- Exit Price: {exit_price:.4f}\n"
-        f"- Qty: {qty}\n"
-        f"- Reason: {reason}"
-    )
-    threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, message))).start()
-
-def send_daily_report(bot: Bot, chat_id: str) -> None:
-    """Send daily PnL report via Telegram."""
+def send_daily_report(bot, chat_id):
     report = calculate_pnl_report('daily')
     subject = f"Daily PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
     threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
-def send_weekly_report(bot: Bot, chat_id: str) -> None:
-    """Send weekly PnL report via Telegram."""
+def send_weekly_report(bot, chat_id):
     report = calculate_pnl_report('weekly')
     subject = f"Weekly PnL Report - Week of {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
     threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
-def send_monthly_report(bot: Bot, chat_id: str) -> None:
-    """Send monthly PnL report via Telegram."""
+def send_monthly_report(bot, chat_id):
     report = calculate_pnl_report('monthly')
     subject = f"Monthly PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m')}"
     threading.Thread(target=lambda: asyncio.run(send_telegram_message(bot, chat_id, f"{subject}\n{report}"))).start()
 
-def request_stop(signum: int, frame: any, client: 'BinanceClient', symbol: str) -> None:
-    """Handle stop signal: close positions and cancel orders."""
-    global STOP_REQUESTED
+def _request_stop(signum, frame, symbol=None):
+    global STOP_REQUESTED, client
     STOP_REQUESTED = True
-    logger.info("Stop requested. Closing positions and cancelling orders...")
-    if client and symbol:
-        try:
-            pos = client.get_position_risk(symbol)
+    log("Stop requested. Closing positions and cancelling orders...")
+    try:
+        if client and symbol:
+            pos = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
             pos_amt = Decimal(str(pos[0].get("positionAmt", "0"))) if pos and len(pos) > 0 else Decimal('0')
-            if pos_amt != Decimal('0'):
+            if pos_amt != 0:
                 side = "SELL" if pos_amt > 0 else "BUY"
                 qty = abs(pos_amt)
-                client.create_order(symbol, side, "MARKET", quantity=str(qty))
-                logger.info(f"Closed position: qty={qty} {side}")
+                try:
+                    client.send_signed_request("POST", "/fapi/v1/order", {
+                        "symbol": symbol,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": str(qty)
+                    })
+                    log(f"Closed position: qty={qty} {side}")
+                except Exception as e:
+                    log(f"Failed to close position: {str(e)}")
             client.cancel_all_open_orders(symbol)
-            logger.info(f"All open orders cancelled for {symbol}.")
-        except Exception as e:
-            logger.error(f"Failed to handle stop: {str(e)}")
+            log(f"All open orders cancelled for {symbol}.")
+        else:
+            log("Client or symbol not defined; skipping position closure and order cancellation.")
+    except Exception as e:
+        log(f"Failed to handle stop: {str(e)}")
 
 # -------- TIME SYNC CHECK ----------
-def check_time_offset(base_url: str) -> float:
-    """Check time offset with Binance server, with retries."""
-    max_attempts = 3
-    for attempt in range(max_attempts):
-        try:
-            response = requests.get(f"{base_url}/fapi/v1/time", timeout=15, verify=certifi.where())
-            server_time_ms = response.json()['serverTime']
-            server_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc)
-            local_time = datetime.now(timezone.utc)
-            offset = (server_time - local_time).total_seconds()
-            logger.info(f"Time offset from Binance: {offset:.2f} seconds (attempt {attempt+1}/{max_attempts})")
-            return offset
-        except Exception as e:
-            logger.warning(f"Binance time sync failed (attempt {attempt+1}/{max_attempts}): {str(e)}")
-            if attempt < max_attempts - 1:
-                sleep_time = 2 ** attempt
-                time.sleep(sleep_time)
-    logger.error("All time sync attempts failed. Using local time.")
-    return 0.0
+def check_time_offset(base_url):
+    try:
+        response = requests.get(f"{base_url}/fapi/v1/time", timeout=5)
+        server_time_ms = response.json()['serverTime']
+        server_time = datetime.fromtimestamp(server_time_ms / 1000, tz=timezone.utc)
+        local_time = datetime.now(timezone.utc)
+        offset = (server_time - local_time).total_seconds()
+        log(f"Time offset from Binance: {offset} seconds")
+        if abs(offset) > 5:
+            log("Warning: Clock offset > 5s. Using recvWindow=10000.")
+    except Exception as e:
+        log(f"Binance time sync failed: {str(e)}")
 
 # -------- BINANCE CLIENT ----------
 class BinanceAPIError(Exception):
-    """Custom exception for Binance API errors."""
-    def __init__(self, message: str, status_code: Optional[int] = None, payload: Optional[any] = None):
+    def __init__(self, message, status_code=None, payload=None):
         super().__init__(message)
         self.status_code = status_code
         self.payload = payload
 
 class BinanceClient:
-    """Binance Futures API client with signing, retries, and public/private separation."""
-    def __init__(self, api_key: str, api_secret: str, use_live: bool = False, base_override: Optional[str] = None):
+    def __init__(self, api_key, api_secret, use_live=False, base_override=None):
         self.api_key = api_key
         self.api_secret = api_secret
         self.use_live = use_live
         self.base = base_override or ("https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com")
-        logger.info(f"Using base URL: {self.base}")
-        self.time_offset = check_time_offset(self.base)
-        self.symbol_filters_cache: Dict[str, any] = {}
-        self.klines_cache: Dict[str, any] = {}
-        self.klines_cache_time: Dict[str, float] = {}
-
-    def _get_server_time(self) -> int:
-        """Fetch server time with fallback to local."""
-        try:
-            response = requests.get(f"{self.base}/fapi/v1/time", timeout=15, verify=certifi.where())
-            return response.json()['serverTime']
-        except Exception:
-            logger.warning("Failed to fetch server time. Using local time.")
-            return int((datetime.now(timezone.utc) + timedelta(seconds=self.time_offset)).timestamp() * 1000)
+        print(f"🔗 Using base URL: {self.base}")
+        check_time_offset(self.base)
 
     def _sign(self, query_string: str) -> str:
-        """Generate HMAC SHA256 signature."""
         return hmac.new(self.api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-    def send_public_request(self, method: str, endpoint: str, params: Optional[Dict[str, any]] = None) -> any:
-        """Send public API request without signing."""
-        params = params or {}
-        url = f"{self.base}{endpoint}"
-        if params:
-            url += "?" + urlencode(params)
-        for attempt in range(5):
-            try:
-                r = requests.request(method, url, timeout=30, verify=certifi.where())
-                r.raise_for_status()
-                return r.json()
-            except requests.exceptions.HTTPError as e:
-                logger.warning(f"Public request failed (attempt {attempt+1}/5): HTTP {r.status_code} - {r.text}")
-            except Exception as e:
-                logger.warning(f"Public request failed (attempt {attempt+1}/5): {str(e)}")
-            if attempt < 4:
-                time.sleep(2 ** attempt)
-        raise BinanceAPIError("Max retries exceeded for public request.")
-
-    def send_signed_request(self, method: str, endpoint: str, params: Optional[Dict[str, any]] = None) -> any:
-        """Send signed API request with retries."""
+    def send_signed_request(self, method: str, endpoint: str, params: dict = None):
         params = params.copy() if params else {}
-        params["timestamp"] = self._get_server_time()
-        params["recvWindow"] = 10000
-        query = urlencode(sorted(params.items()))
-        signature = self._sign(query)
-        url = f"{self.base}{endpoint}?{query}&signature={signature}"
-        headers = {"X-MBX-APIKEY": self.api_key}
         for attempt in range(5):
             try:
-                r = requests.request(method, url, headers=headers, timeout=30, verify=certifi.where())
+                response = requests.get(f"{self.base}/fapi/v1/time", timeout=5)
+                server_time_ms = response.json()['serverTime']
+                params["timestamp"] = server_time_ms
+            except Exception as e:
+                log(f"Time sync failed (attempt {attempt+1}/5): {str(e)}. Using local time.")
+                params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = 10000
+            query = urlencode({k: str(params[k]) for k in sorted(params.keys())})
+            signature = self._sign(query)
+            url = f"{self.base}{endpoint}?{query}&signature={signature}"
+            headers = {"X-MBX-APIKEY": self.api_key}
+            try:
+                r = requests.request(method, url, headers=headers, timeout=20)
                 if r.status_code == 200:
                     response = r.json()
                     if isinstance(response, dict) and response.get("code") not in (None, 200):
-                        raise BinanceAPIError(f"API error: {response.get('msg', 'Unknown')} (code {response.get('code')})", r.status_code, response)
+                        raise BinanceAPIError(f"API error: {response.get('msg', 'Unknown error')} (code {response.get('code')})", status_code=r.status_code, payload=response)
                     return response
                 else:
                     try:
                         payload = r.json()
-                    except ValueError:
+                    except Exception:
                         payload = r.text
-                    raise BinanceAPIError(f"HTTP {r.status_code}: {payload}", r.status_code, payload)
+                    raise BinanceAPIError(f"HTTP {r.status_code}: {payload}", status_code=r.status_code, payload=payload)
             except BinanceAPIError as e:
-                logger.warning(f"Signed request failed (attempt {attempt+1}/5): {str(e)}")
                 if attempt < 4:
                     time.sleep(2 ** attempt)
-                else:
-                    raise
+                    continue
+                raise
             except Exception as e:
-                logger.warning(f"Signed request failed (attempt {attempt+1}/5): {str(e)}")
                 if attempt < 4:
                     time.sleep(2 ** attempt)
+                    continue
+                raise BinanceAPIError(f"Request failed after retries: {str(e)}", payload=str(e))
+
+    def public_request(self, path: str, params: dict = None):
+        url = f"{self.base}{path}"
+        for attempt in range(2):
+            try:
+                r = requests.get(url, params=params, timeout=20, headers={})
+                if r.status_code == 200:
+                    return r.json()
                 else:
-                    raise
+                    try:
+                        payload = r.json()
+                    except Exception:
+                        payload = r.text
+                    raise BinanceAPIError(f"Public API error: {payload}", status_code=r.status_code, payload=payload)
+            except Exception as e:
+                time.sleep(1)
+                if attempt == 1:
+                    raise BinanceAPIError(f"Public API request failed: {str(e)}", payload=str(e))
 
-    def get_klines(self, symbol: str, interval: str, limit: int = KLINES_LIMIT) -> List[List[any]]:
-        """Fetch klines (public)."""
-        cache_key = f"{symbol}_{interval}_{limit}"
-        current_time = time.time()
-        if cache_key in self.klines_cache and current_time - self.klines_cache_time.get(cache_key, 0) < KLINES_CACHE_DURATION:
-            return self.klines_cache[cache_key]
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        klines = self.send_public_request("GET", "/fapi/v1/klines", params)
-        self.klines_cache[cache_key] = klines
-        self.klines_cache_time[cache_key] = current_time
-        return klines
-
-    def get_symbol_ticker(self, symbol: str) -> Dict[str, any]:
-        """Fetch ticker price (public)."""
-        params = {"symbol": symbol}
-        return self.send_public_request("GET", "/fapi/v1/ticker/price", params)
-
-    def get_exchange_info(self) -> Dict[str, any]:
-        """Fetch exchange info (public)."""
-        return self.send_public_request("GET", "/fapi/v1/exchangeInfo")
-
-    def get_position_risk(self, symbol: str) -> List[Dict[str, any]]:
-        """Fetch position risk (signed)."""
-        params = {"symbol": symbol}
-        return self.send_signed_request("GET", "/fapi/v2/positionRisk", params)
-
-    def cancel_all_open_orders(self, symbol: str) -> any:
-        """Cancel all open orders (signed)."""
-        params = {"symbol": symbol}
-        return self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", params)
-
-    def get_open_orders(self, symbol: str) -> List[Dict[str, any]]:
-        """Fetch open orders (signed)."""
+    def get_open_orders(self, symbol: str):
         params = {"symbol": symbol}
         return self.send_signed_request("GET", "/fapi/v1/openOrders", params)
 
-    def create_order(self, symbol: str, side: str, order_type: str, **kwargs: any) -> Dict[str, any]:
-        """Create order (signed)."""
-        params = {"symbol": symbol, "side": side, "type": order_type}
-        params.update(kwargs)
-        return self.send_signed_request("POST", "/fapi/v1/order", params)
+    def cancel_all_open_orders(self, symbol: str):
+        params = {"symbol": symbol}
+        return self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", params)
 
-    def get_account(self) -> Dict[str, any]:
-        """Fetch account info (signed)."""
-        return self.send_signed_request("GET", "/fapi/v2/account")
-
-    def get_user_trades(self, symbol: str, startTime: Optional[int] = None, limit: int = 20) -> List[Dict[str, any]]:
-        """Fetch recent user trades (signed)."""
-        params = {"symbol": symbol, "limit": limit}
-        if startTime:
-            params["startTime"] = startTime
-        return self.send_signed_request("GET", "/fapi/v1/userTrades", params)
-
-    def set_leverage(self, symbol: str, leverage: int) -> Dict[str, any]:
-        """Set leverage for symbol (signed)."""
-        params = {"symbol": symbol, "leverage": leverage}
-        return self.send_signed_request("POST", "/fapi/v1/leverage", params)
-
-# -------- TRADE MANAGEMENT ----------
-class TradeState:
-    """Manages state of an active trade."""
-    def __init__(self):
-        self.active: bool = False
-        self.trade_id: int = 0
-        self.entry_price: Decimal = Decimal('0')
-        self.qty: Decimal = Decimal('0')
-        self.side: str = ""
-        self.entry_close_time: int = 0
-        self.exit_close_time: int = 0
-        self.sl: Decimal = Decimal('0')
-        self.tp: Decimal = Decimal('0')
-        self.r: Decimal = Decimal('0')  # Risk amount (R)
-        self.trail_activated: bool = False
-        self.trail_order_id: Optional[int] = None
-        self.sl_order_id: Optional[int] = None
-        self.tp_order_id: Optional[int] = None
-        self.trail_activation_price: Decimal = Decimal('0')
-
-def fetch_balance(client: BinanceClient) -> Decimal:
-    """Fetch available balance with retries."""
-    max_attempts = 3
-    for attempt in range(max_attempts):
+    def get_latest_fill_price(self, symbol: str, order_id: int):
+        params = {"symbol": symbol, "orderId": order_id}
         try:
-            account = client.get_account()
-            return Decimal(str(account.get('availableBalance', '0')))
+            trades = self.send_signed_request("GET", "/fapi/v1/userTrades", params)
+            if trades and len(trades) > 0:
+                return Decimal(str(trades[-1].get("price", "0")))
+            return None
+        except BinanceAPIError as e:
+            log(f"Failed to fetch fill price: {str(e)}, payload: {e.payload}")
+            return None
         except Exception as e:
-            logger.warning(f"Balance fetch failed (attempt {attempt+1}/{max_attempts}): {str(e)}")
-            if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)
-    raise BinanceAPIError("Failed to fetch balance after max retries.")
+            log(f"Failed to fetch fill price: {str(e)}")
+            return None
 
-def fetch_open_position_details(client: BinanceClient, symbol: str) -> Dict[str, any]:
-    """Fetch position details."""
-    return client.get_position_risk(symbol)[0]
-
-def has_active_position(client: BinanceClient, symbol: str) -> bool:
-    """Check if there's an active position."""
-    pos = fetch_open_position_details(client, symbol)
-    return abs(Decimal(str(pos.get("positionAmt", "0")))) > Decimal('0')
-
-def place_market_order(client: BinanceClient, symbol: str, side: str, qty: Decimal) -> Dict[str, any]:
-    """Place market order."""
-    return client.create_order(symbol, side, 'MARKET', quantity=str(qty))
-
-def place_sl_order(client: BinanceClient, symbol: str, price: Decimal, side: str) -> Dict[str, any]:
-    """Place stop-loss order (close position)."""
-    return client.create_order(symbol, side, 'STOP_MARKET', closePosition=True, stopPrice=str(price))
-
-def place_tp_order(client: BinanceClient, symbol: str, price: Decimal, side: str) -> Dict[str, any]:
-    """Place take-profit order (close position)."""
-    return client.create_order(symbol, side, 'TAKE_PROFIT_MARKET', closePosition=True, stopPrice=str(price))
-
-def place_trailing_stop(client: BinanceClient, symbol: str, side: str, activation_price: Decimal, callback_rate: Decimal) -> Dict[str, any]:
-    """Place trailing stop order."""
-    return client.create_order(
-        symbol, side, 'TRAILING_STOP_MARKET',
-        activationPrice=str(activation_price),
-        callbackRate=str(callback_rate),
-        closePosition=True
-    )
-
-def get_symbol_filters(client: BinanceClient, symbol: str) -> Dict[str, Decimal]:
-    """Fetch and cache symbol filters."""
-    if symbol not in client.symbol_filters_cache:
-        exchange_info = client.get_exchange_info()
-        for s in exchange_info["symbols"]:
-            if s["symbol"] == symbol:
-                filters = {f["filterType"]: f for f in s["filters"]}
-                client.symbol_filters_cache[symbol] = {
-                    "tickSize": Decimal(str(filters["PRICE_FILTER"]["tickSize"])),
-                    "stepSize": Decimal(str(filters["LOT_SIZE"]["stepSize"])),
-                    "minNotional": Decimal(str(filters["NOTIONAL"]["minNotional"]))
-                }
-                break
-        else:
-            raise ValueError(f"Symbol {symbol} not found in exchange info.")
-    return client.symbol_filters_cache[symbol]
-
-# -------- INDICATOR CALCULATIONS ----------
-def calculate_ema(series: List[float], period: int) -> List[float]:
-    """Calculate Exponential Moving Average (EMA) list."""
-    emas = []
-    if len(series) < period:
-        return emas
-    sma = statistics.mean(series[:period])
-    emas = [sma] * (period - 1) + [sma]  # Pad for index alignment, but actually start from period
-    alpha = 2 / (period + 1)
-    for price in series[period:]:
-        sma = alpha * price + (1 - alpha) * sma
-        emas.append(sma)
-    return emas
-
-def calculate_macd(closes: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Calculate MACD line, signal, and histogram."""
-    if len(closes) < MACD_SLOW + MACD_SIGNAL - 1:
-        return None, None, None
-    ema_fast_full = calculate_ema(closes, MACD_FAST)
-    ema_slow_full = calculate_ema(closes, MACD_SLOW)
-    offset = len(ema_fast_full) - len(ema_slow_full)
-    macd_lines = []
-    for i in range(len(ema_slow_full)):
-        fast_idx = i + offset
-        if fast_idx < len(ema_fast_full):
-            macd_lines.append(ema_fast_full[fast_idx] - ema_slow_full[i])
-    if len(macd_lines) < MACD_SIGNAL:
-        return macd_lines[-1] if macd_lines else None, None, None
-    signal_full = calculate_ema(macd_lines, MACD_SIGNAL)
-    macd_line = macd_lines[-1]
-    signal = signal_full[-1]
-    histogram = macd_line - signal
-    return macd_line, signal, histogram
-
-def calculate_rsi(closes: List[float], period: int = RSI_PERIOD) -> Optional[float]:
-    """Calculate Wilder's RSI."""
+# -------- UTILITIES & INDICATORS ----------
+def compute_rsi(closes, period=RSI_PERIOD):
     if len(closes) < period + 1:
         return None
-    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    initial_gains = [max(0, ch) for ch in changes[:period]]
-    initial_losses = [abs(min(0, ch)) for ch in changes[:period]]
-    avg_gain = sum(initial_gains) / period
-    avg_loss = sum(initial_losses) / period
-    for ch in changes[period:]:
-        current_gain = max(0, ch)
-        current_loss = abs(min(0, ch))
-        avg_gain = (avg_gain * (period - 1) + current_gain) / period
-        avg_loss = (avg_loss * (period - 1) + current_loss) / period
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(0, d) for d in deltas]
+    losses = [abs(min(0, d)) for d in deltas]
+    avg_gain = statistics.mean(gains[-period:])
+    avg_loss = statistics.mean(losses[-period:])
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+    return round(rsi, 3)
 
-# -------- MONITORING ----------
-def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, tick_size: Decimal, bot: Bot, chat_id: str) -> None:
-    """Monitor active trade for closure and updates."""
-    logger.info(f"Monitoring trade {trade_state.trade_id} ({trade_state.side})...")
-    last_position_check = 0.0
-    close_side = "SELL" if trade_state.side == "LONG" else "BUY"
-    while trade_state.active and not STOP_REQUESTED and not os.path.exists("stop.txt"):
-        current_time = time.time()
-        if current_time - last_position_check >= POSITION_CHECK_INTERVAL:
+def compute_macd(closes, fast=MACD_FAST, slow=MACD_SLOW, signal=MACD_SIGNAL):
+    if len(closes) < slow + signal:
+        return None, None, None, None
+    closes_dec = [Decimal(str(c)) for c in closes]
+    ema_fast = []
+    ema_slow = []
+    k_fast = Decimal('2') / (fast + 1)
+    k_slow = Decimal('2') / (slow + 1)
+    ema_fast.append(sum(closes_dec[:fast]) / fast)
+    ema_slow.append(sum(closes_dec[:slow]) / slow)
+    for i in range(1, len(closes_dec)):
+        if i >= fast:
+            ema_fast.append(closes_dec[i] * k_fast + ema_fast[-1] * (1 - k_fast))
+        if i >= slow:
+            ema_slow.append(closes_dec[i] * k_slow + ema_slow[-1] * (1 - k_slow))
+    if len(ema_fast) < slow - fast + 1:
+        return None, None, None, None
+    macd_line = [f - s for f, s in zip(ema_fast[-(slow - fast + 1):], ema_slow)]
+    signal_line = []
+    k_signal = Decimal('2') / (signal + 1)
+    signal_line.append(sum(macd_line[:signal]) / signal)
+    for i in range(1, len(macd_line)):
+        signal_line.append(macd_line[i] * k_signal + signal_line[-1] * (1 - k_signal))
+    macd = macd_line[-1]
+    signal_val = signal_line[-1]
+    hist = macd - signal_val
+    prev_macd = macd_line[-2] if len(macd_line) >= 2 else None
+    prev_signal = signal_line[-2] if len(signal_line) >= 2 else None
+    bullish_crossover = prev_macd and prev_signal and prev_macd <= prev_signal and macd > signal_val
+    bearish_crossover = prev_macd and prev_signal and prev_macd >= prev_signal and macd < signal_val
+    return round(float(macd), 3), round(float(signal_val), 3), bullish_crossover, bearish_crossover
+
+def sma(data, period):
+    if len(data) < period:
+        return None
+    return sum(data[-period:]) / period
+
+def quantize_qty(qty, step_size):
+    step = Decimal(str(step_size))
+    q = (Decimal(str(qty)) // step) * step
+    if q == 0:
+        q = step
+    return q.quantize(step)
+
+def quantize_price(p, tick_size, rounding=ROUND_HALF_EVEN):
+    tick_size_dec = Decimal(str(tick_size))
+    precision = abs(tick_size_dec.as_tuple().exponent)
+    return Decimal(str(p)).quantize(Decimal(f'0.{"0" * precision}'), rounding=rounding)
+
+# -------- SYMBOL FILTERS ----------
+def get_symbol_filters(client: BinanceClient, symbol: str):
+    global symbol_filters_cache
+    if symbol_filters_cache is not None:
+        return symbol_filters_cache
+    info = client.public_request("/fapi/v1/exchangeInfo")
+    s = next((x for x in info.get("symbols", []) if x.get("symbol") == symbol.upper()), None)
+    if not s:
+        raise ValueError(f"{symbol} not found in exchangeInfo")
+    filters = {f["filterType"]: f for f in s.get("filters", [])}
+    lot = filters.get("LOT_SIZE")
+    if not lot:
+        raise ValueError("LOT_SIZE filter missing for symbol")
+    step_size = Decimal(str(lot["stepSize"]))
+    min_qty = Decimal(str(lot["minQty"]))
+    tick_size = Decimal(str(filters.get("PRICE_FILTER", {}).get("tickSize", "0.00000001")))
+    min_notional = Decimal(str(filters.get("MIN_NOTIONAL", {}).get("notional", "0")))
+    symbol_filters_cache = {"stepSize": step_size, "minQty": min_qty, "tickSize": tick_size, "minNotional": min_notional}
+    log(f"Fetched symbol filters for {symbol}: tickSize={tick_size}, stepSize={step_size}, minQty={min_qty}, minNotional={min_notional}")
+    return symbol_filters_cache
+
+# -------- ORDERS ----------
+def place_market_order(client: BinanceClient, symbol: str, side: str, quantity):
+    params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
+    return client.send_signed_request("POST", "/fapi/v1/order", params)
+
+def place_sl_order_closepos(client: BinanceClient, symbol: str, stop_price, side: str):
+    filters = get_symbol_filters(client, symbol)
+    tick_size = filters['tickSize']
+    stop_price_quant = quantize_price(stop_price, tick_size, ROUND_DOWN)
+    log(f"Placing SL order: stopPrice={stop_price_quant}, tickSize={tick_size}")
+    params = {"symbol": symbol, "side": side, "type": "STOP_MARKET", "closePosition": "true", "stopPrice": str(stop_price_quant), "goodTillDate": 0}
+    return client.send_signed_request("POST", "/fapi/v1/order", params)
+
+def place_tp_order_closepos(client: BinanceClient, symbol: str, stop_price, side: str):
+    filters = get_symbol_filters(client, symbol)
+    tick_size = filters['tickSize']
+    stop_price_quant = quantize_price(stop_price, tick_size, ROUND_UP)
+    log(f"Placing TP order: stopPrice={stop_price_quant}, tickSize={tick_size}")
+    params = {"symbol": symbol, "side": side, "type": "TAKE_PROFIT_MARKET", "closePosition": "true", "stopPrice": str(stop_price_quant), "goodTillDate": 0}
+    return client.send_signed_request("POST", "/fapi/v1/order", params)
+
+def place_trailing_stop(client: BinanceClient, symbol: str, side: str, activation_price, callback_rate, qty, sl_price):
+    filters = get_symbol_filters(client, symbol)
+    tick_size = filters['tickSize']
+    activation_price_quant = quantize_price(activation_price, tick_size)
+    qty_quant = quantize_qty(qty, filters['stepSize'])
+    callback_rate_dec = min(max(Decimal(str(callback_rate)).quantize(Decimal('0.01')), CALLBACK_RATE_MIN), CALLBACK_RATE_MAX)
+    trail_distance = 2 * abs(sl_price - activation_price_quant)  # 2R
+    initial_stop_price = quantize_price(
+        activation_price_quant + trail_distance if side == "BUY" else activation_price_quant - trail_distance,
+        tick_size
+    )
+    log(f"Trailing stop setup: activationPrice={activation_price_quant}, trailDistance={trail_distance} (2R), initialStopPrice={initial_stop_price}, callbackRate={callback_rate_dec}%")
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "TRAILING_STOP_MARKET",
+        "activationPrice": str(activation_price_quant),
+        "callbackRate": str(callback_rate_dec),
+        "quantity": str(qty_quant),
+        "reduceOnly": "true"
+    }
+    try:
+        response = client.send_signed_request("POST", "/fapi/v1/order", params)
+        returned_stop_price = Decimal(str(response.get('stopPrice', '0')))
+        returned_callback_rate = Decimal(str(response.get('callbackRate', '0')))
+        log(f"Trailing stop placed: stopPrice={returned_stop_price}, activationPrice={activation_price_quant}, trailDistance={trail_distance} (2R), callbackRate={returned_callback_rate}%")
+        if returned_stop_price != initial_stop_price or returned_callback_rate != callback_rate_dec:
+            log(f"Warning: Binance response differs - expected stopPrice={initial_stop_price}, callbackRate={callback_rate_dec}%")
+        return response
+    except BinanceAPIError as e:
+        log(f"Trailing stop error: {str(e)}, payload: {e.payload}")
+        if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
+            log(f"Precision error detected. Falling back to STOP_MARKET at initialStopPrice={initial_stop_price}")
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "STOP_MARKET",
+                "stopPrice": str(initial_stop_price),
+                "quantity": str(qty_quant),
+                "reduceOnly": "true"
+            }
             try:
-                pos = fetch_open_position_details(client, symbol)
-                pos_amt = Decimal(str(pos.get("positionAmt", "0")))
-                unrealized_pnl = Decimal(str(pos.get("unRealizedProfit", "0")))
-                logger.info(f"Unrealized PnL: {unrealized_pnl:.2f} USDT")
-                if abs(pos_amt) == Decimal('0'):
-                    # Position closed
-                    open_orders = client.get_open_orders(symbol)
-                    trail_order = next((o for o in open_orders if o.get("orderId") == trade_state.trail_order_id), None) if trade_state.trail_order_id else None
-                    sl_order = next((o for o in open_orders if o.get("orderId") == trade_state.sl_order_id), None) if trade_state.sl_order_id else None
-                    tp_order = next((o for o in open_orders if o.get("orderId") == trade_state.tp_order_id), None) if trade_state.tp_order_id else None
-                    # Get exact exit price from trades
-                    recent_trades = client.get_user_trades(symbol, trade_state.entry_close_time)
-                    close_trades = [t for t in recent_trades if t['side'] == close_side and Decimal(str(t['qty'])) == trade_state.qty]
-                    exit_price = Decimal(str(close_trades[-1]['price'])) if close_trades else Decimal(str(client.get_symbol_ticker(symbol).get("price", "0")))
-                    if trade_state.trail_activated and not trail_order:
-                        reason = "Trailing Stop"
-                    elif not sl_order and trade_state.sl_order_id:
-                        reason = "Stop-Loss"
-                    elif not tp_order and trade_state.tp_order_id:
-                        reason = "Take-Profit"
-                    else:
-                        reason = "Unknown"
-                    logger.info(f"Position closed ({reason}): {trade_state.side}, qty={trade_state.qty}, exit={exit_price:.4f}")
-                    log_pnl(trade_state.trade_id, trade_state.side, trade_state.entry_price, exit_price, trade_state.qty, trade_state.r)
-                    send_exit_telegram(symbol, trade_state.trade_id, trade_state.side, float(exit_price), float(trade_state.qty), reason, bot, chat_id)
-                    client.cancel_all_open_orders(symbol)
-                    trade_state.active = False
-                    trade_state.exit_close_time = int(current_time * 1000)
-                else:
-                    # Check trailing activation
-                    current_price = Decimal(str(client.get_symbol_ticker(symbol).get("price")))
-                    if not trade_state.trail_activated and trade_state.trail_activation_price:
+                response = client.send_signed_request("POST", "/fapi/v1/order", params)
+                log(f"Fallback STOP_MARKET placed: stopPrice={initial_stop_price}, qty={qty_quant}")
+                return response
+            except BinanceAPIError as e:
+                log(f"Fallback STOP_MARKET failed: {str(e)}, payload: {e.payload}")
+                raise
+        raise
+
+# -------- DATA FETCHING ----------
+def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
+    global klines_cache, klines_cache_time
+    current_time = time.time()
+    if klines_cache and (current_time - klines_cache_time) < KLINES_CACHE_DURATION:
+        log("Using cached klines")
+        return klines_cache
+    try:
+        klines = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        klines_cache = klines
+        klines_cache_time = current_time
+        return klines
+    except BinanceAPIError as e:
+        log(f"Klines fetch failed: {str(e)}, payload: {e.payload}")
+        raise
+    except Exception as e:
+        log(f"Klines fetch failed: {str(e)}")
+        raise
+
+def fetch_balance(client: BinanceClient):
+    try:
+        data = client.send_signed_request("GET", "/fapi/v2/account")
+        balance = Decimal(str(data.get("totalWalletBalance", 0)))
+        log(f"Fetched balance: {balance} USDT")
+        return balance
+    except BinanceAPIError as e:
+        log(f"Balance fetch failed: {str(e)}, payload: {e.payload}")
+        raise
+    except Exception as e:
+        log(f"Balance fetch failed: {str(e)}")
+        raise
+
+def has_active_position(client: BinanceClient, symbol: str):
+    try:
+        positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        return any(p.get("symbol") == symbol and Decimal(str(p.get("positionAmt", "0"))) != 0 for p in positions)
+    except BinanceAPIError as e:
+        log(f"Position check failed: {str(e)}, payload: {e.payload}")
+        return False
+    except Exception as e:
+        log(f"Position check failed: {str(e)}")
+        return False
+
+def fetch_open_positions_details(client: BinanceClient, symbol: str):
+    try:
+        positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        return next((p for p in positions if p.get("symbol") == symbol), None)
+    except BinanceAPIError as e:
+        log(f"Position details fetch failed: {str(e)}, payload: {e.payload}")
+        raise
+    except Exception as e:
+        log(f"Position details fetch failed: {str(e)}")
+        raise
+
+# -------- TRADE STATE ----------
+class TradeState:
+    def __init__(self):
+        self.active = False
+        self.entry_price = None
+        self.qty = None
+        self.side = None
+        self.entry_close_time = None
+        self.exit_close_time = None
+        self.sl = None
+        self.tp = None
+        self.trail_activated = False
+        self.trail_order_id = None
+        self.sl_order_id = None
+        self.tp_order_id = None
+        self.trail_activation_price = None  # Store activation price
+
+# -------- LOGGING SETUP ----------
+class CustomFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+00:00'
+
+logger = logging.getLogger()
+logger.handlers.clear()
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+logger.addHandler(console_handler)
+file_handler = logging.FileHandler('bot.log')
+file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+logger.addHandler(file_handler)
+log = logger.info
+
+# -------- TRADE MONITORING ----------
+def monitor_trade(client, symbol, trade_state, tick_size):
+    log("Monitoring active trade...")
+    last_position_check = 0
+    while trade_state.active:
+        if STOP_REQUESTED or os.path.exists("stop.txt"):
+            log("Stop requested during monitoring. Exiting.")
+            break
+        try:
+            current_time = time.time()
+            if current_time - last_position_check >= POSITION_CHECK_INTERVAL:
+                pos = fetch_open_positions_details(client, symbol)
+                unrealized_pnl = Decimal(str(pos.get("unrealizedProfit", "0"))) if pos else Decimal('0')
+                if unrealized_pnl == 0:
+                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                    current_price = Decimal(str(ticker.get("price")))
+                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                    entry_price = Decimal(str(trade_state.entry_price))
+                    unrealized_pnl = (current_price - entry_price) * pos_amt if pos_amt > 0 else (entry_price - current_price) * pos_amt
+                log(f"Unrealized PNL: {unrealized_pnl.quantize(Decimal('0.01'))} USDT")
+                if not trade_state.trail_activated and trade_state.trail_activation_price:
+                    try:
+                        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                        current_price = Decimal(str(ticker.get("price")))
                         if (trade_state.side == "LONG" and current_price >= trade_state.trail_activation_price) or \
                            (trade_state.side == "SHORT" and current_price <= trade_state.trail_activation_price):
-                            logger.info(f"Trailing stop activated at {current_price:.4f} (activation: {trade_state.trail_activation_price:.4f})")
+                            log(f"Trailing stop activated at price={current_price} (activationPrice={trade_state.trail_activation_price})")
                             trade_state.trail_activated = True
+                    except BinanceAPIError as e:
+                        log(f"Price fetch failed: {str(e)}, payload: {e.payload}")
+                    except Exception as e:
+                        log(f"Price fetch failed: {str(e)}")
+                if trade_state.trail_activated and trade_state.trail_order_id:
+                    try:
+                        orders = client.get_open_orders(symbol)
+                        trail_order = next((o for o in orders if o.get("orderId") == trade_state.trail_order_id), None)
+                        if trail_order:
+                            stop_price = Decimal(str(trail_order.get("stopPrice", "0")))
+                            current_price = Decimal(str(client.public_request("/fapi/v1/ticker/price", {"symbol": symbol}).get("price")))
+                            trail_distance = abs(current_price - stop_price) if trade_state.side == "LONG" else abs(stop_price - current_price)
+                            expected_trail_distance = 2 * abs(trade_state.trail_activation_price - Decimal(str(trade_state.sl)))
+                            log(f"Trailing stop update: stopPrice={stop_price}, currentPrice={current_price}, trailDistance={trail_distance} (expected 2R={expected_trail_distance})")
+                            if abs(trail_distance - expected_trail_distance) > Decimal('0.01') * expected_trail_distance:
+                                log(f"Warning: Trailing distance {trail_distance} deviates from expected 2R={expected_trail_distance}")
+                        else:
+                            log("Trailing stop order no longer exists; position may have closed.")
+                    except BinanceAPIError as e:
+                        log(f"Failed to fetch trailing stop update: {str(e)}, payload: {e.payload}")
+                    except Exception as e:
+                        log(f"Failed to fetch trailing stop update: {str(e)}")
+                pos = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+                pos_amt = Decimal(str(pos[0].get("positionAmt", "0"))) if pos and len(pos) > 0 else Decimal('0')
                 last_position_check = current_time
-            except Exception as e:
-                logger.error(f"Monitor error: {str(e)}")
-                time.sleep(2)
+                if pos_amt == Decimal('0'):
+                    open_orders = client.get_open_orders(symbol)
+                    trail_order = next((o for o in open_orders if o.get("orderId") == trade_state.trail_order_id), None) if trade_state.trail_activated else None
+                    sl_order = next((o for o in open_orders if o.get("orderId") == trade_state.sl_order_id), None) if trade_state.sl_order_id else None
+                    tp_order = next((o for o in open_orders if o.get("orderId") == trade_state.tp_order_id), None) if trade_state.tp_order_id else None
+                    close_side = "BUY" if trade_state.side == "SHORT" else "SELL"
+                    close_qty = Decimal(str(trade_state.qty))
+                    close_price = None
+                    if trade_state.trail_activated and not trail_order:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        log(f"Position closed (trailing stop executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        trade_state.active = False
+                        trade_state.exit_close_time = int(current_time * 1000)
+                        try:
+                            client.cancel_all_open_orders(symbol)
+                            log("All open orders cancelled after trailing stop execution.")
+                        except BinanceAPIError as e:
+                            log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
+                        return
+                    elif sl_order is None and trade_state.sl_order_id:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.sl_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        log(f"Position closed (stop-loss executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        trade_state.active = False
+                        trade_state.exit_close_time = int(current_time * 1000)
+                        try:
+                            client.cancel_all_open_orders(symbol)
+                            log("All open orders cancelled after stop-loss execution.")
+                        except BinanceAPIError as e:
+                            log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
+                        return
+                    elif tp_order is None and trade_state.tp_order_id:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.tp_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        log(f"Position closed (take-profit executed): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        trade_state.active = False
+                        trade_state.exit_close_time = int(current_time * 1000)
+                        try:
+                            client.cancel_all_open_orders(symbol)
+                            log("All open orders cancelled after take-profit execution.")
+                        except BinanceAPIError as e:
+                            log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
+                        return
+                    else:
+                        close_price = client.get_latest_fill_price(symbol, trade_state.trail_order_id or trade_state.sl_order_id or trade_state.tp_order_id)
+                        close_price_str = str(close_price.quantize(Decimal(str(tick_size)))) if close_price else "unknown"
+                        log(f"Position closed (unknown reason): {close_side}, qty={close_qty}, price={close_price_str}")
+                        log_pnl(len(pnl_data) + 1, trade_state.side, trade_state.entry_price, float(close_price or 0), close_qty, R)
+                        trade_state.active = False
+                        trade_state.exit_close_time = int(current_time * 1000)
+                        try:
+                            client.cancel_all_open_orders(symbol)
+                            log("All open orders cancelled after unexpected closure.")
+                        except BinanceAPIError as e:
+                            log(f"Failed to cancel orders: {str(e)}, payload: {e.payload}")
+                        return
+                time.sleep(1)
+        except BinanceAPIError as e:
+            log(f"Monitor error: {str(e)}, payload: {e.payload}")
+            time.sleep(2)
+        except Exception as e:
+            log(f"Monitor error: {str(e)}")
+            time.sleep(2)
 
-# -------- TRADING LOGIC ----------
-def interval_ms(interval: str) -> int:
-    """Convert interval string to milliseconds."""
-    if interval.endswith("m"):
-        return int(interval[:-1]) * 60 * 1000
-    if interval.endswith("h"):
-        return int(interval[:-1]) * 3600 * 1000
-    raise ValueError(f"Invalid interval: {interval}")
-
-def extract_klines_data(klines: List[List[any]]) -> Tuple[List[Decimal], List[Decimal], List[int], List[Decimal]]:
-    """Extract closes, volumes, close times, opens from klines."""
-    closes = [Decimal(str(k[4])) for k in klines]
-    volumes = [Decimal(str(k[5])) for k in klines]
-    close_times = [int(k[6]) for k in klines]
-    opens = [Decimal(str(k[1])) for k in klines]
-    if closes:
-        logger.debug(f"Latest kline: close={closes[-1]}, volume={volumes[-1]}, time={datetime.fromtimestamp(close_times[-1]/1000, tz=timezone.utc)}")
-    return closes, volumes, close_times, opens
-
-def trading_loop(
-    client: BinanceClient,
-    symbol: str,
-    timeframe: str,
-    max_trades_per_day: int,
-    risk_pct: Decimal,
-    max_daily_loss_pct: Decimal,
-    tp_mult: Decimal,
-    use_trailing: bool,
-    prevent_same_bar: bool,
-    require_no_pos: bool,
-    use_max_loss: bool,
-    use_volume_filter: bool,
-    use_macd: bool,
-    bot: Bot,
-    chat_id: str
-) -> None:
-    """Main trading loop: fetch data, check signals, manage trades."""
-    global TRADE_ID_COUNTER
-    last_processed_time: int = 0
-    trades_today: int = 0
-    last_day: date = datetime.now(timezone.utc).date()
-    starting_bal: Decimal = fetch_balance(client)
+# -------- TRADING LOOP ----------
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd, telegram_bot, telegram_chat_id):
+    global R  # Store R for PnL logging
+    log(f"Starting trading loop with timeframe={timeframe}, symbol={symbol}, risk_pct={risk_pct*100}%, use_volume_filter={use_volume_filter}, use_macd={use_macd}")
+    trades_today = 0
+    last_processed_time = 0
     trade_state = TradeState()
-    pending_entry: bool = False
-    interval_millis = interval_ms(timeframe)
+    pending_entry = False
+    daily_start_balance = fetch_balance(client)
+    filters = get_symbol_filters(client, symbol)
+    step_size = filters['stepSize']
+    min_qty = filters['minQty']
+    tick_size = filters['tickSize']
+    min_notional = filters['minNotional']
+    signal.signal(signal.SIGINT, lambda s, f: _request_stop(s, f, symbol))
+    signal.signal(signal.SIGTERM, lambda s, f: _request_stop(s, f, symbol))
+
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
         try:
-            current_day = datetime.now(timezone.utc).date()
-            if current_day != last_day:
-                trades_today = 0
-                starting_bal = fetch_balance(client)
-                last_day = current_day
-                logger.info(f"New day {current_day}: Reset trades_today, starting_bal={starting_bal}")
-
-            server_time = client._get_server_time()
-            next_close_ms = last_processed_time + interval_millis
-            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
-            if sleep_seconds > 1:
-                logger.info(f"Waiting for next candle close in {sleep_seconds:.2f}s...")
-                time.sleep(sleep_seconds)
+            if trades_today >= max_trades_per_day:
+                log("Max trades reached for today. Waiting for next day.")
+                time.sleep(60)
                 continue
 
-            klines = client.get_klines(symbol, timeframe, limit=KLINES_LIMIT)
-            raw_closes = [float(k[4]) for k in klines]
-            closes, volumes, close_times, opens = extract_klines_data(klines)
+            if use_max_loss:
+                current_bal = fetch_balance(client)
+                if daily_start_balance - current_bal > daily_start_balance * (max_daily_loss_pct / Decimal("100")):
+                    log("Max daily loss reached. Waiting for next day.")
+                    time.sleep(60)
+                    continue
+
+            try:
+                server_time_response = client.public_request("/fapi/v1/time")
+                server_time = server_time_response["serverTime"]
+            except BinanceAPIError as e:
+                log(f"Server time fetch failed: {str(e)}, payload: {e.payload}. Using local time.")
+                server_time = int(time.time() * 1000)
+            except Exception as e:
+                log(f"Server time fetch failed: {str(e)}. Using local time.")
+                server_time = int(time.time() * 1000)
+
+            next_close_ms = last_processed_time + interval_ms(timeframe)
+            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
+            if sleep_seconds > 1:
+                log(f"Waiting for candle close in {sleep_seconds:.2f}s ...")
+                _safe_sleep(sleep_seconds)
+                continue
+
+            try:
+                klines = fetch_klines(client, symbol, timeframe, limit=100)
+            except BinanceAPIError as e:
+                log(f"Failed to fetch klines: {str(e)}, payload: {e.payload}")
+                time.sleep(2)
+                continue
+            except Exception as e:
+                log(f"Failed to fetch klines: {str(e)}")
+                time.sleep(2)
+                continue
+
+            closes, volumes, close_times, opens = closes_and_volumes_from_klines(klines)
             last_close_time = close_times[-1]
 
             if last_processed_time == last_close_time:
-                logger.debug(f"Duplicate candle at {last_close_time}; skipping.")
+                log(f"Duplicate candle detected at {last_close_time}; sleeping 1s")
                 time.sleep(1)
                 continue
 
-            # Calculate indicators
-            rsi = calculate_rsi(raw_closes)
-            macd_line, macd_signal, _ = calculate_macd(raw_closes)
-            bullish_crossover = macd_line > macd_signal if macd_line is not None and macd_signal is not None else False
-            bearish_crossover = macd_line < macd_signal if macd_line is not None and macd_signal is not None else False
-            vol_sma = statistics.mean([float(v) for v in volumes[-VOL_SMA_PERIOD:]]) if len(volumes) >= VOL_SMA_PERIOD else None
-            curr_vol = float(volumes[-1])
-            close_price = closes[-1]
-            open_price = opens[-1]
-            is_green = close_price > open_price
-            is_red = close_price < open_price
+            rsi = compute_rsi(closes)
+            macd, signal_val, bullish_crossover, bearish_crossover = compute_macd(closes) if use_macd else (None, None, True, True)  # Default to True if MACD disabled
+            vol_sma15 = sma(volumes, VOL_SMA_PERIOD)
+            curr_vol = volumes[-1]
+            close_price = Decimal(str(closes[-1]))
+            open_price = Decimal(str(opens[-1]))
+            close_time = last_close_time
+            is_green_candle = close_price > open_price
+            is_red_candle = close_price < open_price
 
-            logger.info(
-                f"Candle: open={open_price:.4f}, close={close_price:.4f}, RSI={rsi:.2f if rsi else 'N/A'}, "
-                f"MACD={macd_line:.4f if macd_line else 'N/A'}, Signal={macd_signal:.4f if macd_signal else 'N/A'}, Vol={curr_vol:.2f}, SMA15={vol_sma:.2f if vol_sma else 'N/A'}, "
-                f"{'Green' if is_green else 'Red' if is_red else 'Neutral'}"
-            )
+            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd if use_macd else 'N/A'}, Signal={signal_val if use_macd else 'N/A'}, Vol={curr_vol:.2f}, SMA15={(vol_sma15 or 0):.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
 
-            if prevent_same_bar and trade_state.exit_close_time == last_close_time:
-                logger.info("Same bar as exit; skipping entry.")
-                last_processed_time = last_close_time
+            if prevent_same_bar and trade_state.exit_close_time == close_time:
+                log("Same bar as exit. Skipping to prevent re-entry.")
+                last_processed_time = close_time
+                time.sleep(1)
                 continue
 
             if require_no_pos and has_active_position(client, symbol):
-                logger.info("Active position exists; waiting for closure.")
-                last_processed_time = last_close_time
+                log("Active position detected. Waiting for closure.")
+                last_processed_time = close_time
+                time.sleep(1)
                 continue
 
-            if use_volume_filter and (vol_sma is None or curr_vol <= vol_sma):
-                logger.info("Insufficient volume or history; skipping.")
-                last_processed_time = last_close_time
+            if use_volume_filter and vol_sma15 is None:
+                log("Waiting for volume history...")
+                last_processed_time = close_time
+                time.sleep(1)
                 continue
 
-            buy_signal = rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green and (not use_macd or bullish_crossover)
-            sell_signal = rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red and (not use_macd or bearish_crossover)
+            buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and
+                          (not use_macd or bullish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
+            sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and
+                           (not use_macd or bearish_crossover) and (not use_volume_filter or curr_vol > vol_sma15))
 
-            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry and trades_today < max_trades_per_day:
-                if use_max_loss:
-                    daily_pnl = get_pnl_total_usd('daily')
-                    if daily_pnl < - (max_daily_loss_pct * starting_bal):
-                        logger.info(f"Max daily loss exceeded ({daily_pnl:.2f} < -{max_daily_loss_pct * starting_bal:.2f}). No more trades today.")
-                        last_processed_time = last_close_time
-                        continue
-
-                TRADE_ID_COUNTER += 1
-                trade_state.trade_id = TRADE_ID_COUNTER
-                side = "BUY" if buy_signal else "SELL"
-                logger.info(f"{side} signal detected. Preparing entry (Trade ID: {trade_state.trade_id}).")
+            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
+                last_processed_time = close_time
+                side_text = "BUY" if buy_signal else "SELL"
+                log(f"Signal on candle close -> {side_text}. Preparing entry.")
                 pending_entry = True
 
                 entry_price = close_price
+                entry_price_f = float(entry_price)
                 if buy_signal:
-                    sl_price = entry_price * (Decimal(1) - SL_PCT)
-                    r = entry_price * SL_PCT
-                    tp_price = entry_price + (tp_mult * r)
-                    trail_activation = entry_price + (TRAIL_TRIGGER_MULT * r)
-                    close_side = "SELL"
-                    sl_round = ROUND_DOWN
-                    tp_round = ROUND_UP
+                    sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
+                    R = entry_price * SL_PCT
+                    tp_price_dec = entry_price + (tp_mult * R)
+                    close_side_for_sl = "SELL"
+                    sl_rounding = ROUND_DOWN
+                    tp_rounding = ROUND_UP
                 else:
-                    sl_price = entry_price * (Decimal(1) + SL_PCT)
-                    r = entry_price * SL_PCT
-                    tp_price = entry_price - (tp_mult * r)
-                    trail_activation = entry_price - (TRAIL_TRIGGER_MULT * r)
-                    close_side = "BUY"
-                    sl_round = ROUND_UP
-                    tp_round = ROUND_DOWN
+                    sl_price_dec = entry_price * (Decimal("1") + SL_PCT)
+                    R = entry_price * SL_PCT
+                    tp_price_dec = entry_price - (tp_mult * R)
+                    close_side_for_sl = "BUY"
+                    sl_rounding = ROUND_DOWN
+                    tp_rounding = ROUND_UP
 
-                if r <= 0:
-                    logger.warning(f"Invalid R ({r}); skipping trade.")
+                if R <= Decimal('0'):
+                    log(f"Invalid R ({R}) <= 0. Skipping trade.")
                     pending_entry = False
+                    time.sleep(1)
                     continue
 
                 bal = fetch_balance(client)
                 risk_amount = bal * risk_pct
-                qty = risk_amount / r
-                filters = get_symbol_filters(client, symbol)
-                qty = qty.quantize(filters["stepSize"], ROUND_DOWN)
-                if qty * entry_price < filters["minNotional"]:
-                    qty = (filters["minNotional"] / entry_price).quantize(filters["stepSize"], ROUND_DOWN)
+                qty = risk_amount / R
+                qty_api = quantize_qty(qty, step_size)
+                if qty_api < min_qty:
+                    qty_api = min_qty
+                notional = qty_api * entry_price
+                if notional < min_notional:
+                    qty_api = quantize_qty(min_notional / entry_price, step_size)
 
-                sl_price = sl_price.quantize(filters["tickSize"], sl_round)
-                tp_price = tp_price.quantize(filters["tickSize"], tp_round)
-                trail_activation = trail_activation.quantize(filters["tickSize"])
-                callback_rate = ((Decimal(2) * r) / trail_activation * Decimal(100)).quantize(Decimal('0.01'))
-                callback_rate = max(CALLBACK_RATE_MIN, min(CALLBACK_RATE_MAX, callback_rate))
+                sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                sl_price_f = float(sl_price_dec_quant)
+                tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                tp_price_f = float(tp_price_dec_quant)
 
-                # Place market entry
+                log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}")
+                timed_out = False
+                actual_qty = None
                 try:
-                    place_market_order(client, symbol, side, qty)
-                except Exception as e:
-                    logger.error(f"Market order failed: {str(e)}")
+                    order_res = place_market_order(client, symbol, side_text, qty_api)
+                    log(f"Market order placed: {order_res}")
+                except BinanceAPIError as e:
+                    log(f"Market order failed: {str(e)}, payload: {e.payload}")
                     pending_entry = False
+                    time.sleep(1)
+                    continue
+                except Exception as e:
+                    log(f"Market order failed: {str(e)}")
+                    pending_entry = False
+                    time.sleep(1)
                     continue
 
-                # Wait for fill
+                log("Waiting for entry order to fill...")
                 start_time = time.time()
-                actual_qty = Decimal('0')
-                while time.time() - start_time < ORDER_FILL_TIMEOUT:
+                while True:
                     if STOP_REQUESTED or os.path.exists("stop.txt"):
+                        log("Stop requested during fill wait; aborting entry flow.")
                         break
-                    pos = fetch_open_position_details(client, symbol)
-                    pos_amt = Decimal(str(pos.get("positionAmt", "0")))
-                    if abs(pos_amt) > Decimal('0'):
+                    pos = fetch_open_positions_details(client, symbol)
+                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                    if pos_amt != Decimal('0'):
                         actual_qty = abs(pos_amt)
+                        break
+                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
+                        log("Timeout waiting for fill. Attempting to cancel order...")
+                        cancel_params = {"symbol": symbol, "orderId": order_res.get("orderId")} if isinstance(order_res, dict) else {"symbol": symbol}
+                        try:
+                            client.send_signed_request("DELETE", "/fapi/v1/order", cancel_params)
+                            log("Entry order cancelled.")
+                        except BinanceAPIError as e:
+                            log(f"Cancel failed: {str(e)}, payload: {e.payload}")
+                        except Exception as e:
+                            log(f"Cancel failed: {str(e)}")
+                        timed_out = True
                         break
                     time.sleep(0.5)
 
-                if actual_qty == Decimal('0'):
-                    logger.warning("Entry fill timeout; cancelling orders.")
-                    client.cancel_all_open_orders(symbol)
+                if timed_out or actual_qty is None:
                     pending_entry = False
+                    log("Entry timed out or aborted -> skipping this signal and waiting for next candle.")
                     continue
 
-                actual_entry = Decimal(str(pos.get("entryPrice", "0")))  # Use actual entry from position
-                trade_state.active = True
-                trade_state.entry_price = actual_entry
-                trade_state.qty = actual_qty
-                trade_state.side = "LONG" if buy_signal else "SHORT"
-                trade_state.entry_close_time = last_close_time
-                trade_state.sl = sl_price
-                trade_state.tp = tp_price
-                trade_state.r = r
-                trade_state.trail_activation_price = trail_activation
-                logger.info(
-                    f"Position opened (ID: {trade_state.trade_id}): {trade_state.side}, qty={actual_qty}, "
-                    f"entry={actual_entry:.4f}, sl={sl_price:.4f}, tp={tp_price:.4f}, activation={trail_activation:.4f}"
-                )
+                # Fetch actual fill price
+                time.sleep(0.2)  # 200ms delay for fill data
+                actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
+                if actual_fill_price is None:
+                    log("Failed to fetch actual fill price; using candle close price.")
+                    actual_fill_price = entry_price
+                actual_fill_price_f = float(actual_fill_price)
 
-                send_entry_telegram({
-                    'symbol': symbol,
-                    'trade_id': trade_state.trade_id,
-                    'side': trade_state.side,
-                    'entry': float(actual_entry),
-                    'sl': float(sl_price),
-                    'tp': float(tp_price),
-                    'trail_activation': float(trail_activation),
-                    'qty': float(actual_qty)
-                }, bot, chat_id)
+                # Calculate trailing stop parameters
+                if buy_signal:
+                    sl_price_dec_quant = actual_fill_price * (Decimal("1") - SL_PCT)
+                    R = actual_fill_price * SL_PCT
+                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R above entry
+                    trail_distance_dec = 2 * R  # Trailing distance is 2R
+                else:
+                    sl_price_dec_quant = actual_fill_price * (Decimal("1") + SL_PCT)
+                    R = actual_fill_price * SL_PCT
+                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R below entry
+                    trail_distance_dec = 2 * R  # Trailing distance is 2R
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
+                trail_activation_price_f = float(trail_activation_price_dec_quant)
+                callback_rate_dec = (trail_distance_dec / trail_activation_price_dec * Decimal("100")).quantize(Decimal('0.01'))
+                callback_rate_f = float(callback_rate_dec)
 
-                # Place SL/TP/Trailing
-                client.cancel_all_open_orders(symbol)  # Clean slate
+                # Check if trailing stop activation price is too close to current price
                 try:
-                    sl_res = place_sl_order(client, symbol, sl_price, close_side)
-                    trade_state.sl_order_id = sl_res.get("orderId")
-                    tp_res = place_tp_order(client, symbol, tp_price, close_side)
-                    trade_state.tp_order_id = tp_res.get("orderId")
-                    if use_trailing:
-                        trail_res = place_trailing_stop(client, symbol, close_side, trail_activation, callback_rate)
-                        trade_state.trail_order_id = trail_res.get("orderId")
+                    ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                    current_price = Decimal(str(ticker.get("price")))
                 except BinanceAPIError as e:
-                    if e.payload and e.payload.get('code') == -1111:
-                        logger.warning("Precision error; refetching filters and retrying.")
-                        del client.symbol_filters_cache[symbol]
-                        filters = get_symbol_filters(client, symbol)
-                        sl_price = sl_price.quantize(filters["tickSize"], sl_round)
-                        tp_price = tp_price.quantize(filters["tickSize"], tp_round)
-                        trail_activation = trail_activation.quantize(filters["tickSize"])
-                        # Retry placement
-                        sl_res = place_sl_order(client, symbol, sl_price, close_side)
+                    log(f"Price fetch failed: {str(e)}, payload: {e.payload}. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+                except Exception as e:
+                    log(f"Price fetch failed: {str(e)}. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                price_buffer = actual_fill_price * TRAIL_PRICE_BUFFER
+                if buy_signal and trail_activation_price_dec_quant <= current_price + price_buffer:
+                    log(f"Trailing stop activation price {trail_activation_price_dec_quant} too close to current price {current_price}. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+                elif not buy_signal and trail_activation_price_dec_quant >= current_price - price_buffer:
+                    log(f"Trailing stop activation price {trail_activation_price_dec_quant} too close to current price {current_price}. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                trade_state.active = True
+                trade_state.entry_price = actual_fill_price_f
+                trade_state.qty = float(actual_qty)
+                trade_state.side = "LONG" if buy_signal else "SHORT"
+                trade_state.entry_close_time = close_time
+                trade_state.sl = sl_price_f
+                trade_state.tp = tp_price_f
+                trade_state.trail_activated = False
+                trade_state.trail_order_id = None
+                trade_state.sl_order_id = None
+                trade_state.tp_order_id = None
+                trade_state.trail_activation_price = trail_activation_price_dec_quant  # Store activation price
+                log(f"Position opened: {trade_state.side}, qty={actual_qty}, entry={actual_fill_price_f}, sl={sl_price_f}, tp={tp_price_f}, trailActivation={trail_activation_price_f}, trailDistance={trail_distance_dec} (2R)")
+
+                # Send Telegram notification
+                trade_details = {
+                    'symbol': symbol,
+                    'side': trade_state.side,
+                    'entry': trade_state.entry_price,
+                    'sl': trade_state.sl,
+                    'tp': trade_state.tp,
+                    'trail_activation': trade_state.trail_activation_price,
+                    'qty': trade_state.qty
+                }
+                send_trade_telegram(trade_details, telegram_bot, telegram_chat_id)
+
+                try:
+                    log("Cancelling all existing open orders for symbol before placing SL/TP...")
+                    try:
+                        cancel_res = client.cancel_all_open_orders(symbol)
+                        log(f"Cancel all orders response: {cancel_res}")
+                    except BinanceAPIError as e:
+                        log(f"Failed to cancel existing orders: {str(e)}, payload: {e.payload}")
+                    except Exception as e:
+                        log(f"Failed to cancel existing orders: {str(e)}. Proceeding with SL/TP placement.")
+
+                    try:
+                        sl_res = place_sl_order_closepos(client, symbol, sl_price_dec_quant, close_side_for_sl)
                         trade_state.sl_order_id = sl_res.get("orderId")
-                        tp_res = place_tp_order(client, symbol, tp_price, close_side)
+                        log(f"SL response: {sl_res}")
+                    except BinanceAPIError as e:
+                        if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
+                            log(f"SL precision error. Re-fetching filters and retrying...")
+                            symbol_filters_cache = None  # Reset cache
+                            filters = get_symbol_filters(client, symbol)
+                            tick_size = filters['tickSize']
+                            sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
+                            sl_res = place_sl_order_closepos(client, symbol, sl_price_dec_quant, close_side_for_sl)
+                            trade_state.sl_order_id = sl_res.get("orderId")
+                            log(f"SL retry response: {sl_res}")
+                        else:
+                            raise
+
+                    try:
+                        tp_res = place_tp_order_closepos(client, symbol, tp_price_dec_quant, close_side_for_sl)
                         trade_state.tp_order_id = tp_res.get("orderId")
-                        if use_trailing:
-                            trail_res = place_trailing_stop(client, symbol, close_side, trail_activation, callback_rate)
+                        log(f"TP response: {tp_res}")
+                    except BinanceAPIError as e:
+                        if e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1111:
+                            log(f"TP precision error. Re-fetching filters and retrying...")
+                            symbol_filters_cache = None  # Reset cache
+                            filters = get_symbol_filters(client, symbol)
+                            tick_size = filters['tickSize']
+                            tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
+                            tp_res = place_tp_order_closepos(client, symbol, tp_price_dec_quant, close_side_for_sl)
+                            trade_state.tp_order_id = tp_res.get("orderId")
+                            log(f"TP retry response: {tp_res}")
+                        else:
+                            raise
+
+                    if use_trailing:
+                        log(f"Placing trailing stop: activationPrice={trail_activation_price_f}, callbackRate={callback_rate_f}%, trailDistance={trail_distance_dec} (2R)")
+                        try:
+                            trail_res = place_trailing_stop(client, symbol, close_side_for_sl, trail_activation_price_f, callback_rate_f, Decimal(str(actual_qty)), sl_price_dec_quant)
+                            trade_state.trail_activated = False  # Reset, will be set on price check
                             trade_state.trail_order_id = trail_res.get("orderId")
-                    else:
-                        logger.error(f"Failed to place bracket orders: {str(e)}")
+                            log(f"Trailing stop response: {trail_res}")
+                        except BinanceAPIError as e:
+                            log(f"Failed to place trailing stop: {str(e)}, payload: {e.payload}. Continuing with SL/TP only.")
+
+                except BinanceAPIError as e:
+                    log(f"Could not place SL/TP orders: {str(e)}, payload: {e.payload}")
+                except Exception as e:
+                    log(f"Could not place SL/TP orders: {str(e)}")
+
+                try:
+                    open_orders = client.get_open_orders(symbol)
+                    log(f"Open orders after SL/TP and trailing stop attempt: {open_orders}")
+                except BinanceAPIError as e:
+                    log(f"Failed to fetch open orders: {str(e)}, payload: {e.payload}")
+                except Exception as e:
+                    log(f"Failed to fetch open orders: {str(e)}")
 
                 trades_today += 1
                 pending_entry = False
-                monitor_trade(client, symbol, trade_state, filters["tickSize"], bot, chat_id)
+                monitor_trade(client, symbol, trade_state, tick_size)
 
-            last_processed_time = last_close_time
+            elif trade_state.active or pending_entry:
+                log("Trade active or pending. Skipping signal check.")
 
+            else:
+                log("No trade signal on candle close.")
+
+            if last_processed_time != close_time:
+                last_processed_time = close_time
+
+            next_close_ms = last_processed_time + interval_ms(timeframe)
+            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
+            log(f"Waiting for candle close in {sleep_seconds:.2f}s ...")
+            _safe_sleep(sleep_seconds)
+
+        except BinanceAPIError as e:
+            log(f"Loop error: {str(e)}, payload: {e.payload}")
+            time.sleep(2)
         except Exception as e:
-            logger.error(f"Trading loop error: {str(e)}")
+            log(f"Loop error: {str(e)}")
             time.sleep(2)
 
-# -------- SCHEDULER FOR REPORTS ----------
-def run_scheduler(bot: Bot, chat_id: str) -> None:
-    """Run scheduler for periodic reports."""
-    last_month: Optional[int] = None
-    def check_monthly() -> None:
-        nonlocal last_month
-        now = datetime.now(timezone.utc)
-        if now.day == 1 and (last_month is None or now.month != last_month):
-            send_monthly_report(bot, chat_id)
-            last_month = now.month
+    log("Trading loop exited.")
 
-    schedule.every().day.at("23:59").do(send_daily_report, bot, chat_id)
-    schedule.every().sunday.at("23:59").do(send_weekly_report, bot, chat_id)
-    schedule.every().day.at("00:00").do(check_monthly)
-    while not STOP_REQUESTED:
+def interval_ms(interval):
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60 * 1000
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 60 * 60 * 1000
+    return 30 * 60 * 1000  # 30m default
+
+def _safe_sleep(total_seconds):
+    remaining = float(total_seconds)
+    while remaining > 0:
+        if STOP_REQUESTED or os.path.exists("stop.txt"):
+            break
+        time.sleep(min(1, remaining))
+        remaining -= 1
+
+def closes_and_volumes_from_klines(klines):
+    closes = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
+    close_times = [int(k[6]) for k in klines]
+    opens = [float(k[1]) for k in klines]
+    return closes, volumes, close_times, opens
+
+# -------- SCHEDULER FOR REPORTS ----------
+def run_scheduler(bot, chat_id):
+    last_month = None
+    def check_monthly_report():
+        nonlocal last_month
+        current_date = datetime.now(timezone.utc)
+        if current_date.day == 1 and (last_month is None or current_date.month != last_month):
+            send_monthly_report(bot, chat_id)
+            last_month = current_date.month
+
+    schedule.every().day.at("23:59").do(lambda: send_daily_report(bot, chat_id))
+    schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot, chat_id))
+    schedule.every().day.at("00:00").do(check_monthly_report)
+    while True:
         schedule.run_pending()
         time.sleep(60)
 
 # -------- ENTRY POINT ----------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Professional Binance Futures Trading Bot")
-    parser.add_argument("--api-key", help="Binance API Key")
-    parser.add_argument("--api-secret", help="Binance API Secret")
-    parser.add_argument("--telegram-token", help="Telegram Bot Token")
-    parser.add_argument("--chat-id", help="Telegram Chat ID")
+    parser = argparse.ArgumentParser(description="Binance Futures RSI+MACD Bot (Headless, 30m Optimized, SOLUSDT)")
+    parser.add_argument("--api-key", required=True, help="Binance API Key")
+    parser.add_argument("--api-secret", required=True, help="Binance API Secret")
+    parser.add_argument("--telegram-token", required=True, help="Telegram Bot Token")
+    parser.add_argument("--chat-id", required=True, help="Telegram Chat ID")
     parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol (default: SOLUSDT)")
     parser.add_argument("--timeframe", default="30m", help="Timeframe (default: 30m)")
     parser.add_argument("--max-trades", type=int, default=3, help="Max trades per day (default: 3)")
-    parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk % per trade (default: 0.5)")
+    parser.add_argument("--risk-pct", type=float, default=0.5, help="Risk percentage per trade (default: 0.5%)")
     parser.add_argument("--max-loss-pct", type=float, default=5.0, help="Max daily loss percentage (default: 5%)")
-    parser.add_argument("--tp-mult", type=float, default=3.5, help="TP multiplier (default: 3.5)")
-    parser.add_argument("--leverage", type=int, default=1, help="Leverage (default: 1)")
-    parser.add_argument("--no-trailing", action="store_false", dest="use_trailing", help="Disable trailing stop")
-    parser.add_argument("--allow-same-bar", action="store_false", dest="prevent_same_bar", help="Allow same-bar re-entry")
-    parser.add_argument("--allow-pos", action="store_false", dest="require_no_pos", help="Allow trading with open pos")
-    parser.add_argument("--no-max-loss", action="store_false", dest="use_max_loss", help="Disable max daily loss check")
-    parser.add_argument("--no-volume", action="store_false", dest="use_volume_filter", help="Disable volume filter")
-    parser.add_argument("--no-macd", action="store_false", dest="use_macd", help="Disable MACD")
-    parser.add_argument("--live", action="store_true", help="Use live trading (default: testnet)")
+    parser.add_argument("--tp-mult", type=float, default=3.5, help="Take-profit multiplier (default: 3.5)")
+    parser.add_argument("--no-trailing", dest='use_trailing', action='store_false', help="Disable trailing stop (default: enabled)")
+    parser.add_argument("--no-prevent-same-bar", dest='prevent_same_bar', action='store_false', help="Allow entries on same bar (default: prevent same bar)")
+    parser.add_argument("--no-require-no-pos", dest='require_no_pos', action='store_false', help="Allow entry even if there's an active position (default: require no pos)")
+    parser.add_argument("--no-use-max-loss", dest='use_max_loss', action='store_false', help="Disable max daily loss protection (default: enabled)")
+    parser.add_argument("--use-volume-filter", action='store_true', default=False, help="Use volume filter (vol > SMA15)")
+    parser.add_argument("--no-volume-filter", action='store_false', dest='use_volume_filter', help="Disable volume filter")
+    parser.add_argument("--use-macd", action='store_true', default=False, help="Use MACD confirmation (default: False)")
+    parser.add_argument("--live", action="store_true", help="Use live Binance (default: Testnet)")
+    parser.add_argument("--base-url", default=None, help="Override base URL for Binance API (advanced)")
+
     args = parser.parse_args()
 
-    # Fallback to env vars for sensitive args
-    args.api_key = args.api_key or os.getenv('API_KEY')
-    args.api_secret = args.api_secret or os.getenv('API_SECRET')
-    args.telegram_token = args.telegram_token or os.getenv('TELEGRAM_TOKEN')
-    args.chat_id = args.chat_id or os.getenv('CHAT_ID')
-
-    # Validate required sensitive args
-    if not args.api_key or not args.api_secret or not args.telegram_token or not args.chat_id:
-        raise ValueError("Missing required arguments: api_key, api_secret, telegram_token, chat_id (provide via args or env vars)")
-
     init_pnl_log()
+
     telegram_bot = Bot(token=args.telegram_token)
-    binance_client = BinanceClient(args.api_key, args.api_secret, args.live)
-    try:
-        binance_client.set_leverage(args.symbol, args.leverage)
-        logger.info(f"Leverage set to {args.leverage}x for {args.symbol}")
-    except Exception as e:
-        logger.warning(f"Failed to set leverage: {str(e)}")
-    signal.signal(signal.SIGINT, lambda s, f: request_stop(s, f, binance_client, args.symbol))
-    signal.signal(signal.SIGTERM, lambda s, f: request_stop(s, f, binance_client, args.symbol))
-    threading.Thread(target=run_scheduler, args=(telegram_bot, args.chat_id), daemon=True).start()
+
+    client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
+    log(f"Connected ({'LIVE' if args.live else 'TESTNET'}). Starting bot with symbol={args.symbol}, timeframe={args.timeframe}, risk_pct={args.risk_pct}%, use_volume_filter={args.use_volume_filter}, use_macd={args.use_macd}")
+
+    # Schedule reports in a separate thread
+    threading.Thread(target=lambda: run_scheduler(telegram_bot, args.chat_id), daemon=True).start()
+
     trading_loop(
-        client=binance_client,
+        client=client,
         symbol=args.symbol,
         timeframe=args.timeframe,
         max_trades_per_day=args.max_trades,
-        risk_pct=Decimal(str(args.risk_pct / 100)),
-        max_daily_loss_pct=Decimal(str(args.max_loss_pct / 100)),
+        risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
+        max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
         tp_mult=Decimal(str(args.tp_mult)),
         use_trailing=args.use_trailing,
         prevent_same_bar=args.prevent_same_bar,
@@ -898,6 +1100,6 @@ if __name__ == "__main__":
         use_max_loss=args.use_max_loss,
         use_volume_filter=args.use_volume_filter,
         use_macd=args.use_macd,
-        bot=telegram_bot,
-        chat_id=args.chat_id
+        telegram_bot=telegram_bot,
+        telegram_chat_id=args.chat_id
     )
