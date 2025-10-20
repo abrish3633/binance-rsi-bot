@@ -626,24 +626,197 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
                 # Fetch actual fill price
                 time.sleep(0.2)  # 200ms delay for fill data
-                actual_fill_price = client.get_latest_fill_price(symbol, order_res.get("orderId"))
+def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_daily_loss_pct, tp_mult, use_trailing, prevent_same_bar, require_no_pos, use_max_loss, use_volume_filter, use_macd, telegram_bot, telegram_chat_id):
+    last_processed_time = 0  # Initialized to fix loop error
+    trades_today = 0
+    daily_loss = Decimal('0')
+    trade_state = TradeState()
+    pending_entry = False
+    server_time = int(time.time() * 1000)  # Use local time as fallback
+    avg_gain = 0.0  # Initialize outside loop
+    avg_loss = 0.0001  # Initialize to avoid division by zero
+    try:
+        server_time = client.send_signed_request("GET", "/fapi/v1/time")["serverTime"]
+    except Exception:
+        log("Failed to sync server time. Using local time.")
+    while not STOP_REQUESTED and not os.path.exists("stop.txt"):
+        try:
+            next_close_ms = last_processed_time + interval_ms(timeframe)
+            sleep_seconds = max(1.0, (next_close_ms - server_time + 500) / 1000.0)
+            if sleep_seconds > 1:
+                log(f"Waiting for candle close in {sleep_seconds:.2f}s ...")
+                _safe_sleep(sleep_seconds)
+                continue
+
+            klines = client.get_klines(symbol, timeframe, limit=100)
+            closes, volumes, close_times, opens = closes_and_volumes_from_klines(klines)
+            last_close_time = close_times[-1]
+
+            if last_processed_time == last_close_time:
+                log(f"Duplicate candle detected at {last_close_time}; sleeping 1s")
+                time.sleep(1)
+                continue
+
+            # Calculate RSI with Wilder's smoothing
+            raw_closes = [float(k[4]) for k in klines[-RSI_PERIOD-1:]] if len(klines) > RSI_PERIOD else []
+            log(f"Raw closes for RSI (last {RSI_PERIOD+1} periods): {raw_closes}")
+            rsi = None
+            if len(raw_closes) > 1:
+                price_changes = [raw_closes[i] - raw_closes[i-1] for i in range(1, len(raw_closes))]
+                gains = [max(0, change) for change in price_changes]
+                losses = [-min(0, change) for change in price_changes]
+                if len(gains) < RSI_PERIOD:  # First RSI_PERIOD periods
+                    avg_gain = sum(gains) / len(gains) if gains else 0.0
+                    avg_loss = sum(losses) / len(losses) if losses else 0.0001
+                else:
+                    avg_gain = (avg_gain * 13 + gains[-1]) / 14
+                    avg_loss = (avg_loss * 13 + losses[-1]) / 14 if losses else avg_loss * 13 / 14
+                rs = avg_gain / avg_loss if avg_loss > 0 else 0 if avg_gain == 0 else float('inf')
+                rsi = 100 - (100 / (1 + rs)) if avg_loss > 0 else 100 if avg_gain == 0 else 0
+                log(f"RSI calculation: avg_gain={avg_gain}, avg_loss={avg_loss}, RS={rs}, RSI={rsi}")
+            else:
+                log("Insufficient data for RSI calculation.")
+
+            macd_fast = statistics.mean([float(k[4]) for k in klines[-MACD_FAST:]]) if len(klines) >= MACD_FAST else None
+            macd_slow = statistics.mean([float(k[4]) for k in klines[-MACD_SLOW:]]) if len(klines) >= MACD_SLOW else None
+            macd_signal = statistics.mean([macd_fast - macd_slow for _ in range(MACD_SIGNAL)]) if macd_fast and macd_slow and len(klines) >= MACD_SLOW + MACD_SIGNAL else None
+            bullish_crossover = macd_fast > macd_signal and (not macd_signal or macd_fast > macd_slow)
+            bearish_crossover = macd_fast < macd_signal and (not macd_signal or macd_fast < macd_slow)
+            vol_sma15 = statistics.mean(volumes[-VOL_SMA_PERIOD:]) if len(volumes) >= VOL_SMA_PERIOD else None
+            curr_vol = volumes[-1]
+            close_price = Decimal(str(closes[-1]))
+            open_price = Decimal(str(opens[-1]))
+            close_time = last_close_time
+            is_green_candle = close_price > open_price
+            is_red_candle = close_price < open_price
+
+            log(f"Candle open={open_price}, close={close_price}, RSI={rsi}, MACD={macd_fast-macd_slow if macd_fast and macd_slow else 'N/A'}, Signal={macd_signal if macd_signal else 'N/A'}, Vol={curr_vol:.2f}, SMA15={vol_sma15 or 0:.2f}, {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle")
+
+            if prevent_same_bar and trade_state.exit_close_time == close_time:
+                log("Same bar as exit. Skipping to prevent re-entry.")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            if require_no_pos and has_active_position(client, symbol):
+                log("Active position detected. Waiting for closure.")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            if use_volume_filter and (vol_sma15 is None or curr_vol <= vol_sma15):
+                log("Waiting for volume history or insufficient volume...")
+                last_processed_time = close_time
+                time.sleep(1)
+                continue
+
+            buy_signal = rsi and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_macd or bullish_crossover)
+            sell_signal = rsi and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and (not use_macd or bearish_crossover)
+
+            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
+                last_processed_time = close_time
+                side_text = "BUY" if buy_signal else "SELL"
+                log(f"Signal on candle close -> {side_text}. Preparing entry.")
+                pending_entry = False
+
+                entry_price = close_price
+                entry_price_f = float(entry_price)
+                if buy_signal:
+                    sl_price_dec = entry_price * (Decimal("1") - SL_PCT)
+                    R = entry_price * SL_PCT
+                    tp_price_dec = entry_price + (tp_mult * R)
+                    close_side_for_sl = "SELL"
+                    sl_rounding = ROUND_DOWN
+                    tp_rounding = ROUND_UP
+                else:
+                    sl_price_dec = entry_price * (Decimal("1") + SL_PCT)
+                    R = entry_price * SL_PCT
+                    tp_price_dec = entry_price - (tp_mult * R)
+                    close_side_for_sl = "BUY"
+                    sl_rounding = ROUND_DOWN
+                    tp_rounding = ROUND_UP
+
+                if R <= Decimal('0'):
+                    log(f"Invalid R ({R}) <= 0. Skipping trade.")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                bal = fetch_balance(client)
+                risk_amount = bal * risk_pct
+                qty = risk_amount / R
+                filters = get_symbol_filters(client, symbol)
+                qty_api = quantize_qty(qty, filters['stepSize'])
+                if qty_api < Decimal('0.01'):
+                    qty_api = Decimal('0.01')
+                notional = qty_api * entry_price
+                if notional < filters['minNotional']:
+                    qty_api = quantize_qty(filters['minNotional'] / entry_price, filters['stepSize'])
+
+                sl_price_dec_quant = quantize_price(sl_price_dec, filters['tickSize'], sl_rounding)
+                sl_price_f = float(sl_price_dec_quant)
+                tp_price_dec_quant = quantize_price(tp_price_dec, filters['tickSize'], tp_rounding)
+                tp_price_f = float(tp_price_dec_quant)
+
+                log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}")
+                timed_out = False
+                actual_qty = None
+                try:
+                    order_res = place_market_order(client, symbol, side_text, qty_api)
+                    log(f"Market order placed: {order_res}")
+                except Exception as e:
+                    log(f"Market order failed: {str(e)}")
+                    pending_entry = False
+                    time.sleep(1)
+                    continue
+
+                log("Waiting for entry order to fill...")
+                start_time = time.time()
+                while True:
+                    if STOP_REQUESTED or os.path.exists("stop.txt"):
+                        log("Stop requested during fill wait; aborting entry flow.")
+                        break
+                    pos = fetch_open_positions_details(client, symbol)
+                    pos_amt = Decimal(str(pos.get("positionAmt", "0"))) if pos else Decimal('0')
+                    if pos_amt != Decimal('0'):
+                        actual_qty = abs(pos_amt)
+                        break
+                    if time.time() - start_time > ORDER_FILL_TIMEOUT:
+                        log("Timeout waiting for fill. Attempting to cancel order...")
+                        try:
+                            client.cancel_all_open_orders(symbol)
+                            log("Entry order cancelled.")
+                        except Exception as e:
+                            log(f"Cancel failed: {str(e)}")
+                        timed_out = True
+                        break
+                    time.sleep(0.5)
+
+                if timed_out or actual_qty is None:
+                    pending_entry = False
+                    log("Entry timed out or aborted -> skipping this signal and waiting for next candle.")
+                    continue
+
+                # Fetch actual fill price
+                time.sleep(0.2)  # 200ms delay for fill data
+                actual_fill_price = client.get_symbol_ticker(symbol).get("price", entry_price)
                 if actual_fill_price is None:
                     log("Failed to fetch actual fill price; using candle close price.")
                     actual_fill_price = entry_price
-                actual_fill_price_f = float(actual_fill_price)
+                actual_fill_price_f = float(Decimal(str(actual_fill_price)))
 
                 # Calculate trailing stop parameters
                 if buy_signal:
                     sl_price_dec_quant = actual_fill_price * (Decimal("1") - SL_PCT)
                     R = actual_fill_price * SL_PCT
-                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R above entry
-                    trail_distance_dec = 2 * R  # Trailing distance is 2R
+                    trail_activation_price_dec = actual_fill_price + (TRAIL_TRIGGER_MULT * R)
+                    trail_distance_dec = 2 * R
                 else:
                     sl_price_dec_quant = actual_fill_price * (Decimal("1") + SL_PCT)
                     R = actual_fill_price * SL_PCT
-                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)  # Activation at 1.25R below entry
-                    trail_distance_dec = 2 * R  # Trailing distance is 2R
-                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, tick_size)
+                    trail_activation_price_dec = actual_fill_price - (TRAIL_TRIGGER_MULT * R)
+                    trail_distance_dec = 2 * R
+                trail_activation_price_dec_quant = quantize_price(trail_activation_price_dec, filters['tickSize'])
                 trail_activation_price_f = float(trail_activation_price_dec_quant)
                 callback_rate_dec = (trail_distance_dec / trail_activation_price_dec * Decimal("100")).quantize(Decimal('0.01'))
                 callback_rate_f = float(callback_rate_dec)
@@ -759,7 +932,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
                 trades_today += 1
                 pending_entry = False
-                monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                monitor_trade(client, symbol, trade_state, filters['tickSize'], telegram_bot, telegram_chat_id)
 
             elif trade_state.active or pending_entry:
                 log("Trade active or pending. Skipping signal check.")
