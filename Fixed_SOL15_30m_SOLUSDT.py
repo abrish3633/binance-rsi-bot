@@ -180,11 +180,13 @@ def _request_stop(signum, frame, symbol=None, trade_state=None, telegram_bot=Non
                     log(f"Closed position: qty={qty} {side}")
                     if trade_state and telegram_bot and telegram_chat_id:
                         exit_price = client.get_latest_fill_price(symbol, close_order.get("orderId"))
-                        exit_price = float(exit_price) if exit_price else trade_state.sl
-                        R = abs(Decimal(str(trade_state.sl)) - Decimal(str(trade_state.entry_price)))
+                        exit_price = Decimal(str(exit_price)) if exit_price else Decimal(str(trade_state.sl))
+                        entry_price = Decimal(str(trade_state.entry_price))
+                        R = abs(Decimal(str(trade_state.sl)) - entry_price)
+                        pnl = qty * (exit_price - entry_price) * (-1 if trade_state.side == "SHORT" else 1)
                         trade_id = len(pnl_data) + 1
-                        log_pnl(trade_id, trade_state.side, trade_state.entry_price, exit_price, qty, R)
-                        send_close_telegram(symbol, trade_state.side, qty, exit_price, "Manual Stop", telegram_bot, telegram_chat_id)
+                        log_pnl(trade_id, trade_state.side, float(entry_price), float(exit_price), qty, R)
+                        send_close_telegram(symbol, trade_state.side, qty, float(exit_price), "Manual Stop", telegram_bot, telegram_chat_id)
                 except Exception as e:
                     log(f"Failed to close position: {str(e)}")
             client.cancel_all_open_orders(symbol)
@@ -193,7 +195,6 @@ def _request_stop(signum, frame, symbol=None, trade_state=None, telegram_bot=Non
             log("Client or symbol not defined; skipping position closure and order cancellation.")
     except Exception as e:
         log(f"Failed to handle stop: {str(e)}")
-
 # -------- TIME SYNC CHECK ----------
 def check_time_offset(base_url):
     try:
