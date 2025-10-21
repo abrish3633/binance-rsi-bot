@@ -1125,7 +1125,7 @@ if __name__ == "__main__":
         risk_pct=Decimal(str(args.risk_pct)) / Decimal("100"),
         max_daily_loss_pct=Decimal(str(args.max_loss_pct)),
         tp_mult=Decimal(str(args.tp_mult)),
-        use_trailing=args.use_trailing
+        use_trailing=args.use_trailing,
         prevent_same_bar=args.prevent_same_bar,
         require_no_pos=args.require_no_pos,
         use_max_loss=args.use_max_loss,
