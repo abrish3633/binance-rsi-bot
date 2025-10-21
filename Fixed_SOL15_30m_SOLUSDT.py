@@ -4,6 +4,7 @@
 # - Defers trailing stop placement to monitor_trade() when market hits activationPrice.
 # - Stores trail_distance, close_side, and qty_decimal in TradeState for correct trailing stop placement.
 # - Includes PNL reporting for daily, weekly, and monthly periods.
+# - Enhanced error handling for HTTP 408 timeouts and rate limits.
 import argparse
 import logging
 import time
@@ -45,6 +46,8 @@ CALLBACK_RATE_MAX = Decimal("5.0")
 POSITION_CHECK_INTERVAL = 60
 TRAIL_PRICE_BUFFER = Decimal("0.003")
 KLINES_CACHE_DURATION = 5.0
+REQUEST_TIMEOUT = 30  # Increased from 20 to 30 seconds
+MAX_RETRIES = 5
 
 # Global stop flag and client
 STOP_REQUESTED = False
@@ -215,15 +218,28 @@ class BinanceClient:
     def _sign(self, query_string: str) -> str:
         return hmac.new(self.api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
+    def check_api_status(self):
+        try:
+            response = requests.get(f"{self.base}/fapi/v1/ping", timeout=5)
+            if response.status_code == 200:
+                log("Binance API is reachable.")
+                return True
+            else:
+                log(f"API ping failed with status {response.status_code}.")
+                return False
+        except Exception as e:
+            log(f"API ping failed: {str(e)}")
+            return False
+
     def send_signed_request(self, method: str, endpoint: str, params: dict = None):
         params = params.copy() if params else {}
-        for attempt in range(5):
+        for attempt in range(MAX_RETRIES):
             try:
                 response = requests.get(f"{self.base}/fapi/v1/time", timeout=5)
                 server_time_ms = response.json()['serverTime']
                 params["timestamp"] = server_time_ms
             except Exception as e:
-                log(f"Time sync failed (attempt {attempt+1}/5): {str(e)}. Using local time.")
+                log(f"Time sync failed (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}. Using local time.")
                 params["timestamp"] = int(time.time() * 1000)
             params["recvWindow"] = 10000
             query = urlencode({k: str(params[k]) for k in sorted(params.keys())})
@@ -231,12 +247,22 @@ class BinanceClient:
             url = f"{self.base}{endpoint}?{query}&signature={signature}"
             headers = {"X-MBX-APIKEY": self.api_key}
             try:
-                r = requests.request(method, url, headers=headers, timeout=20)
+                r = requests.request(method, url, headers=headers, timeout=REQUEST_TIMEOUT)
                 if r.status_code == 200:
                     response = r.json()
                     if isinstance(response, dict) and response.get("code") not in (None, 200):
+                        if response.get('code') == -1003:  # Rate limit error
+                            log(f"Rate limit exceeded. Waiting 10s before retry {attempt+1}/{MAX_RETRIES}.")
+                            time.sleep(10)
+                            continue
                         raise BinanceAPIError(f"API error: {response.get('msg', 'Unknown error')} (code {response.get('code')})", status_code=r.status_code, payload=response)
                     return response
+                elif r.status_code == 408:  # Timeout error
+                    log(f"HTTP 408 Timeout (attempt {attempt+1}/{MAX_RETRIES}): {r.text}")
+                    if attempt < MAX_RETRIES - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    raise BinanceAPIError(f"HTTP 408 after retries: {r.text}", status_code=r.status_code, payload=r.text)
                 else:
                     try:
                         payload = r.json()
@@ -244,12 +270,12 @@ class BinanceClient:
                         payload = r.text
                     raise BinanceAPIError(f"HTTP {r.status_code}: {payload}", status_code=r.status_code, payload=payload)
             except BinanceAPIError as e:
-                if attempt < 4:
+                if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue
                 raise
             except Exception as e:
-                if attempt < 4:
+                if attempt < MAX_RETRIES - 1:
                     time.sleep(2 ** attempt)
                     continue
                 raise BinanceAPIError(f"Request failed after retries: {str(e)}", payload=str(e))
@@ -258,7 +284,7 @@ class BinanceClient:
         url = f"{self.base}{path}"
         for attempt in range(2):
             try:
-                r = requests.get(url, params=params, timeout=20, headers={})
+                r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={})
                 if r.status_code == 200:
                     return r.json()
                 else:
@@ -382,7 +408,32 @@ def get_symbol_filters(client: BinanceClient, symbol: str):
 # -------- ORDERS ----------
 def place_market_order(client: BinanceClient, symbol: str, side: str, quantity):
     params = {"symbol": symbol, "side": side, "type": "MARKET", "quantity": str(quantity)}
-    return client.send_signed_request("POST", "/fapi/v1/order", params)
+    for attempt in range(MAX_RETRIES):
+        if not client.check_api_status():
+            log(f"API not reachable before placing market order (attempt {attempt+1}/{MAX_RETRIES}). Retrying after 2s...")
+            time.sleep(2)
+            continue
+        try:
+            response = client.send_signed_request("POST", "/fapi/v1/order", params)
+            log(f"Market order placed successfully: {response}")
+            return response
+        except BinanceAPIError as e:
+            if e.status_code == 408 or (e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1007):
+                log(f"Market order timeout (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}, payload: {e.payload}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+            elif e.payload and isinstance(e.payload, dict) and e.payload.get('code') == -1003:
+                log(f"Rate limit exceeded for market order. Waiting 10s before retry {attempt+1}/{MAX_RETRIES}.")
+                time.sleep(10)
+                continue
+            raise
+        except Exception as e:
+            log(f"Market order failed (attempt {attempt+1}/{MAX_RETRIES}): {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise BinanceAPIError(f"Market order failed after retries: {str(e)}", payload=str(e))
 
 def place_sl_order_closepos(client: BinanceClient, symbol: str, stop_price, side: str):
     filters = get_symbol_filters(client, symbol)
@@ -962,6 +1013,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                             log(f"TP retry response: {tp_res}")
                         else:
                             raise
+                    # NOTE: DO NOT place trailing stop here — will be placed on activation in monitor_trade()
                 except BinanceAPIError as e:
                     log(f"Could not place SL/TP orders: {str(e)}, payload: {e.payload}")
                 except Exception as e:
