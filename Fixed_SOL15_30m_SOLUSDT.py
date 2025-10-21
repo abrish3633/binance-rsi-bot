@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # Fixed_SOL15_5m_SOLUSDT.py
-# Changes (Oct 21, 2025, 17:43 EAT):
-# - Fixed trailing stop 'reduceOnly' error by removing parameter in One-Way Mode
-# - Fixed 'monitor_trade' type mismatch in log_pnl (Decimal/float consistency)
-# - Replaced TRAILING_STOP_MARKET with manual STOP_MARKET trailing stop
-# - Added cleanup of duplicate orders before placing SL/TP
+# Changes (Oct 21, 2025, 17:51 EAT):
+# - Fixed 'urlencode' NameError by adding 'from urllib.parse import urlencode'
+# - Retained manual trailing stop implementation
+# - Retained fixes for 'reduceOnly' error, type mismatch in log_pnl, and duplicate order cleanup
 # - Fixed actual_fill_price undefined error in trading_loop
 # - Optimized Telegram retries, PNL logging, and order placement
 # - Configured for 5m timeframe, SOLUSDT, Testnet
@@ -27,6 +26,7 @@ from telegram import Bot
 import schedule
 import asyncio
 import backoff
+from urllib.parse import urlencode  # Added to fix NameError
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -186,7 +186,7 @@ def _request_stop(signum, frame, symbol=None, trade_state=None, telegram_bot=Non
                         entry_price = Decimal(str(trade_state.entry_price))
                         R = abs(Decimal(str(trade_state.sl)) - entry_price)
                         log_pnl(len(pnl_data) + 1, trade_state.side, entry_price, exit_price, qty, R)
-                        send_close_telegram(symbol, trade_state.side, qty, float(exit_price), "Manual Stop", telegram_bot, telegram_chat_id)
+                        send_close_telegram(symbol, trade_state.side, float(qty), float(exit_price), "Manual Stop", telegram_bot, telegram_chat_id)
                 except Exception as e:
                     log(f"Failed to close position: {str(e)}")
             client.cancel_all_open_orders(symbol)
