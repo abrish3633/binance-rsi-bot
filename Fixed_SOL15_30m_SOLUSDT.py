@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 # Fixed_SOL15_30m_SOLUSDT.py
 # Changes (Oct 21, 2025):
-# - Added missing `from urllib.parse import urlencode` to fix NameError
-# - Replaced TRAILING_STOP_MARKET with STOP_MARKET, placed when price reaches 1.25R above entry
-# - Removed redundant place_trailing_stop function
-# - Cached is_hedge_mode in BinanceClient
-# - Consolidated SL/TP placement with retry helper
-# - Optimized price fetches in monitor_trade
-# - Added symbol_filters_cache timeout
-# - Maintained prior fixes (e.g., TP=181.0689, SL=187.3446 for entry=185.95)
+# - Fixed trail_trigger_price_dec for LONG trades (entry + 1.25R, not entry - 1.25R)
+# - Retained manual STOP_MARKET trailing stop (placed at 1.25R without activation)
+# - Kept urllib.parse.urlencode import to fix NameError
+# - Maintained prior optimizations (cached is_hedge_mode, consolidated SL/TP, symbol_filters_cache timeout)
 
 import argparse
 import logging
@@ -28,7 +24,7 @@ from telegram import Bot
 import schedule
 import asyncio
 import backoff
-from urllib.parse import urlencode  # Added to fix NameError
+from urllib.parse import urlencode
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -577,7 +573,7 @@ logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(console_handler)
-file_handler = loggingoodle_handler = logging.FileHandler('bot.log')
+file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(file_handler)
 log = logger.info
@@ -587,7 +583,7 @@ def monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram
     last_position_check = 0
     tick_size_dec = Decimal(str(tick_size))
     R = abs(Decimal(str(trade_state.sl)) - Decimal(str(trade_state.entry_price)))
-    trail_trigger_price = (Decimal(str(trade_state.entry_price)) - Decimal('1.25') * R if trade_state.side == "SHORT" else Decimal(str(trade_state.entry_price)) + Decimal('1.25') * R).quantize(tick_size_dec)
+    trail_trigger_price = (Decimal(str(trade_state.entry_price)) + Decimal('1.25') * R if trade_state.side == "LONG" else Decimal(str(trade_state.entry_price)) - Decimal('1.25') * R).quantize(tick_size_dec)
     trail_distance = Decimal('2') * R
     stop_market_placed = False
     while trade_state.active:
@@ -824,7 +820,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 sl_price_f = float(sl_price_dec_quant)
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
                 tp_price_f = float(tp_price_dec_quant)
-                trail_trigger_price_dec = (entry_price - Decimal('1.25') * R if buy_signal else entry_price + Decimal('1.25') * R).quantize(tick_size)
+                trail_trigger_price_dec = (entry_price + Decimal('1.25') * R if buy_signal else entry_price - Decimal('1.25') * R).quantize(tick_size)
                 trail_trigger_price_f = float(trail_trigger_price_dec)
 
                 log(f"Sending MARKET {side_text} order: qty={qty_api}, entry_price={entry_price_f}")
@@ -897,7 +893,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 sl_price_f = float(sl_price_dec_quant)
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
                 tp_price_f = float(tp_price_dec_quant)
-                trail_trigger_price_dec = (actual_fill_price - Decimal('1.25') * R if buy_signal else actual_fill_price + Decimal('1.25') * R).quantize(tick_size)
+                trail_trigger_price_dec = (actual_fill_price + Decimal('1.25') * R if buy_signal else actual_fill_price - Decimal('1.25') * R).quantize(tick_size)
                 trail_trigger_price_f = float(trail_trigger_price_dec)
 
                 try:
