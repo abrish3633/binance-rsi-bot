@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # Fixed_SOL15_30m_SOLUSDT.py
 # Changes (Oct 21, 2025):
+# - Added missing `from urllib.parse import urlencode` to fix NameError
 # - Replaced TRAILING_STOP_MARKET with STOP_MARKET, placed when price reaches 1.25R above entry
 # - Removed redundant place_trailing_stop function
 # - Cached is_hedge_mode in BinanceClient
 # - Consolidated SL/TP placement with retry helper
 # - Optimized price fetches in monitor_trade
 # - Added symbol_filters_cache timeout
-# - Maintained prior fixes (e.g., TP=178.8877, SL=185.0878 for entry=183.71)
+# - Maintained prior fixes (e.g., TP=181.0689, SL=187.3446 for entry=185.95)
 
 import argparse
 import logging
@@ -27,6 +28,7 @@ from telegram import Bot
 import schedule
 import asyncio
 import backoff
+from urllib.parse import urlencode  # Added to fix NameError
 
 # -------- STRATEGY CONFIG (defaults) ----------
 RISK_PCT = Decimal("0.005")          # 0.5% per trade
@@ -575,7 +577,7 @@ logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(console_handler)
-file_handler = logging.FileHandler('bot.log')
+file_handler = loggingoodle_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
 logger.addHandler(file_handler)
 log = logger.info
