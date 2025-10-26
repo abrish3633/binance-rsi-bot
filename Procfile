@@ -1,1 +1,1 @@
-worker: python Fixed_SOL15_30m_SOLUSDT.py --api-key $API_KEY --api-secret $API_SECRET --telegram-token $TELEGRAM_TOKEN --chat-id $CHAT_ID --symbol SOLUSDT --risk-pct 0.5 --timeframe 5m --no-volume-filter
+worker: python botautoworkik.py --api-key=$BINANCE_API_KEY --api-secret=$BINANCE_API_SECRET --telegram-token=$TELEGRAM_TOKEN --chat-id=$TELEGRAM_CHAT_ID --symbol=SOLUSDT --timeframe=5m --max-trades=3 --risk-pct=0.5 --max-loss-pct=5.0 --tp-mult=3.5
