@@ -342,8 +342,18 @@ def place_trailing_stop(client: BinanceClient, symbol: str, side: str, stop_pric
 
 # -------- DATA FETCHING ----------
 def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=100):
+    """
+    Fetch candle data from Binance Futures API and ensure valid JSON format.
+    Fix: Binance API may return extra wrapper dicts, now handled robustly.
+    """
     try:
-        klines = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        data = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        if isinstance(data, dict) and "data" in data:
+            klines = data["data"]
+        else:
+            klines = data
+        if not isinstance(klines, list) or not all(isinstance(k, (list, tuple)) for k in klines):
+            raise ValueError("Invalid klines format received from API.")
         return klines
     except BinanceAPIError as e:
         log(f"Klines fetch failed: {str(e)}, payload: {e.payload}")
