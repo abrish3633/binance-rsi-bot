@@ -1136,7 +1136,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             is_red_candle = close_price < open_price
             
             candle_color = 'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'
-            log(f"Candle close: {float(close_price):.4f} | RSI={rsi:.2f} | Vol={curr_vol:.0f} | SMA15={vol_sma15:.0f} | {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'}")
+            log(f"Candle: {float(close_price):.4f} | RSI: {rsi or 'N/A'} | Vol: {curr_vol:.2f} | SMA15: {vol_sma15:.2f} | {'Green' if is_green_candle else 'Red' if is_red_candle else 'Doji'}", telegram_bot, telegram_chat_id)
 
             # === ENTRY GUARDS ===
             if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == close_time:
