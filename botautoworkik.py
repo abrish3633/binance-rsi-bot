@@ -1117,11 +1117,12 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             log(f"Fetched {len(klines)} klines for {timeframe} timeframe.")
 
             # === SKIP IF SAME CANDLE ALREADY PROCESSED ===
+            last_close_time = close_times[-1] if close_times else 0
             if last_close_time <= last_processed_time:
                 log("Candle already processed or not fully closed.")
                 time.sleep(1)
                 continue
-            last_processed_time += 100  # +100ms buffer to avoid reprocessing
+            last_processed_time = last_close_time + 100
 
             # === CALCULATE INDICATORS ===
             rsi = compute_rsi(closes)
