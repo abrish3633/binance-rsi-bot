@@ -1144,13 +1144,13 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
 
             log(f"Candle: {float(close_price):.4f} | RSI: {rsi or 'N/A'} | Vol: {curr_vol:.2f} | SMA15: {vol_sma15:.2f} | {'Green' if is_green_candle else 'Red' if is_red_candle else 'Doji'}", telegram_bot, telegram_chat_id)
             # === ENTRY GUARDS ===
-            if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == close_time:
+            if prevent_same_bar and getattr(trade_state, 'entry_close_time', None) == last_close_time:
                 log("Entry already attempted this bar. Skipping.", telegram_bot, telegram_chat_id)
                 last_processed_time = close_time
                 time.sleep(1)
                 continue
 
-            if last_exit_candle_time == close_time:
+            if last_exit_candle_time == last_close_time:
                 log("Trade exited this candle. Skipping new entry.", telegram_bot, telegram_chat_id)
                 last_processed_time = close_time
                 _safe_sleep(1)
