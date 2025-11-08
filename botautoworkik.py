@@ -120,19 +120,23 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
     return row
 
 # ------------------- LOGGING SETUP -------------------
-class CustomFormatter(logging.Formatter):
-    def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
-        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+00:00'
+# ------------------- TELEGRAM-STYLE LOGGING (NO TIMESTAMP ON CONSOLE) -------------------
+class CleanFormatter(logging.Formatter):
+    def format(self, record):
+        return record.getMessage()  # Pure message, no timestamp
 
 logger = logging.getLogger()
 logger.handlers.clear()
 logger.setLevel(logging.INFO)
+
+# Console output: clean, Telegram-style
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+console_handler.setFormatter(CleanFormatter())
 logger.addHandler(console_handler)
+
+# File log: full debug with timestamp
 file_handler = logging.FileHandler('bot.log')
-file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s'))
 logger.addHandler(file_handler)
 
 def log(message, telegram_bot=None, telegram_chat_id=None):
