@@ -490,39 +490,6 @@ def quantize_qty(qty: Decimal, step_size: Decimal) -> Decimal:
 def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
     return p.quantize(tick_size, rounding=rounding)
 
-# --- add near other helpers (e.g., after quantize_price) ---
-def aggregate_klines_to_45m(klines_15m):
-    """
-    Convert a list of standard Binance kline rows (as returned by /klines)
-    for interval=15m into aggregated 45m klines (groups of 3).
-    Each output row matches Binance kline format (list-like) expected by the rest of the code.
-    """
-    aggregated = []
-    # require full groups of 3
-    for i in range(0, len(klines_15m), 3):
-        chunk = klines_15m[i:i+3]
-        if len(chunk) < 3:
-            break
-        open_time = int(chunk[0][0])
-        open_price = chunk[0][1]
-        high_price = max(float(k[2]) for k in chunk)
-        low_price = min(float(k[3]) for k in chunk)
-        close_price = chunk[-1][4]
-        volume = sum(float(k[5]) for k in chunk)
-        close_time = int(chunk[-1][6])
-        # match the kline element types the rest of your code expects:
-        aggregated.append([
-            open_time,                       # 0 open time
-            open_price,                      # 1 open
-            str(high_price),                 # 2 high (string/float both OK)
-            str(low_price),                  # 3 low
-            close_price,                     # 4 close
-            str(volume),                     # 5 volume
-            close_time                       # 6 close time
-            # the rest of Binance kline fields are not used by your code
-        ])
-    return aggregated
-
 # ------------------- SYMBOL FILTERS -------------------
 def get_symbol_filters(client: BinanceClient, symbol: str):
     global symbol_filters_cache
@@ -591,23 +558,8 @@ def place_orders(client, symbol, trade_state, tick_size, telegram_bot=None, tele
 # ------------------- DATA FETCHING -------------------
 def fetch_klines(client: BinanceClient, symbol: str, interval: str, limit=max(100, VOL_SMA_PERIOD + 50)):
     try:
-        if interval == "45m":
-            # Binance max klines limit is 1500 — cap request to avoid server error
-            max_api_limit = 1500
-            needed = min(limit * 3, max_api_limit)
-            raw = client.public_request("/fapi/v1/klines", {
-                "symbol": symbol,
-                "interval": "15m",
-                "limit": needed
-            })
-            # raw contains 15m klines; aggregate into 45m
-            return aggregate_klines_to_45m(raw)
-        else:
-            return client.public_request("/fapi/v1/klines", {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit
-            })
+        data = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        return data
     except Exception as e:
         log(f"Klines fetch failed: {str(e)}")
         raise
@@ -1034,14 +986,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             trade_state.trail_order_id = None
             log("Existing position detected on startup. Recovering orders...", telegram_bot, telegram_chat_id)
             debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
-            # Fetch latest candle close_time for recovery (use 1m interval for precision)
-            try:
-                latest_kline = client.public_request("/fapi/v1/klines", {"symbol": symbol, "interval": "1m", "limit": 1})
-                close_time_for_recovery = int(latest_kline[0][6]) if latest_kline else 0  # Fallback to 0 if fail
-            except Exception as e:
-                log(f"Startup kline fetch failed: {e}. Using 0 for close_time.", telegram_bot, telegram_chat_id)
-                close_time_for_recovery = 0
-            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time_for_recovery)
+            monitor_trade(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id, close_time)
 
     # === MAIN LOOP ===
     while not STOP_REQUESTED and not os.path.exists("stop.txt"):
