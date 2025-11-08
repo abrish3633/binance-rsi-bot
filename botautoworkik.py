@@ -610,6 +610,14 @@ def fetch_klines(client, symbol, interval, limit=max(100, VOL_SMA_PERIOD + 50)):
         log(f"Klines fetch failed: {e}")
         raise
 
+def fetch_balance(client: BinanceClient):
+    try:
+        data = client.send_signed_request("GET", "/fapi/v2/account")
+        return Decimal(str(data.get("totalWalletBalance", 0)))
+    except Exception as e:
+        log(f"Balance fetch failed: {str(e)}")
+        raise
+
 def has_active_position(client: BinanceClient, symbol: str):
     try:
         positions = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
