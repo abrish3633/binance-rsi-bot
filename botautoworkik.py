@@ -1114,6 +1114,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             # ------------------------------------------------------------
             last_candle = klines[-1]
             last_close_time = int(last_candle[6])  # ms
+            close_time = last_close_time
 
             dt = datetime.fromtimestamp(last_close_time / 1000, tz=timezone.utc)
             log(f"Aligned to {timeframe} candle close: {dt.strftime('%H:%M')} UTC")
