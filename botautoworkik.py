@@ -120,25 +120,31 @@ def log_pnl(trade_id, side, entry, exit_price, qty, R):
     return row
 
 # ------------------- LOGGING SETUP -------------------
-# ------------------- TELEGRAM-STYLE LOGGING (NO TIMESTAMP ON CONSOLE) -------------------
-class CleanFormatter(logging.Formatter):
-    def format(self, record):
-        return record.getMessage()  # Pure message, no timestamp
+# ------------------- TELEGRAM-STYLE LOGGING: CLEAN, NO NAME, NO TIMESTAMP -------------------
+import logging
 
+# Remove ALL default formatting
+class TelegramStyleFormatter(logging.Formatter):
+    def format(self, record):
+        return record.getMessage()  # Only the message
+
+# Get root logger
 logger = logging.getLogger()
+logger.propagate = False  # Prevent double logging
 logger.handlers.clear()
 logger.setLevel(logging.INFO)
 
-# Console output: clean, Telegram-style
+# Console: Telegram-style (NO name, NO time, NO brackets)
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(CleanFormatter())
+console_handler.setFormatter(TelegramStyleFormatter())
 logger.addHandler(console_handler)
 
-# File log: full debug with timestamp
+# File: Full debug log with timestamp
 file_handler = logging.FileHandler('bot.log')
 file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s'))
 logger.addHandler(file_handler)
 
+# Log function (unchanged)
 def log(message, telegram_bot=None, telegram_chat_id=None):
     logger.info(message)
     if telegram_bot and telegram_chat_id:
