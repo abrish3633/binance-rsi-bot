@@ -215,15 +215,24 @@ def _refresh_news():
     anns = []
     try:
         r = requests.get(ANN_API, params={"type":1, "catalogId":48, "pageNo":1, "pageSize":5}, timeout=5)
-        items = r.json().get("data", {}).get("catalogs", [{}])[0].get("articles", [])
-        for a in items:
-            title = a.get("title", "").upper()
-            if any(k in title for k in SOL_KEYWORDS) and any(k in title for k in ANN_HIGH_IMPACT):
-                pub = datetime.fromtimestamp(a["releaseDate"]/1000, tz=timezone.utc)
-                anns.append({"dt": pub, "title": title})
+        r.raise_for_status()  # ← ADD: Catch HTTP errors
+    
+        if r.text.strip():  # ← ADD: Check for empty response
+            data = r.json()
+            items = data.get("data", {}).get("catalogs", [{}])[0].get("articles", [])
+            for a in items:
+                title = a.get("title", "").upper()
+                if any(k in title for k in SOL_KEYWORDS) and any(k in title for k in ANN_HIGH_IMPACT):
+                    pub = datetime.fromtimestamp(a["releaseDate"]/1000, tz=timezone.utc)
+                    anns.append({"dt": pub, "title": title})
+        else:
+            log("Binance API returned empty response")
+    except requests.exceptions.RequestException as e:
+        log(f"Binance API request failed: {e}")
+    except json.JSONDecodeError as e:
+        log(f"Binance API JSON invalid: {e} | Response: {r.text[:200]}...")
     except Exception as e:
         log(f"Binance announcement fetch failed: {e}")
-
     # === Update caches ===
     with _news_lock:
         _news_cache = high
