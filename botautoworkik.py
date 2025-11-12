@@ -1294,15 +1294,6 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     max_trades_alert_sent = True
                 time.sleep(60)
                 continue
-            
-            # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===
-            bal = fetch_balance(client)
-            drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
-            dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
-            dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
-
-            risk_amount = bal * dynamic_risk_pct
-            qty = risk_amount / R
 
             # === MAX DAILY LOSS PROTECTION ===
             if use_max_loss:
@@ -1459,17 +1450,17 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     pending_entry = False
                     time.sleep(1)
                     continue
+                # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===
+                    bal = fetch_balance(client)
+                    drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
+                    dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
+                    dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
 
-                # === POSITION SIZING ===
-                bal = fetch_balance(client)
-                risk_amount = bal * risk_pct
-                qty = risk_amount / R
-                qty_api = quantize_qty(qty, step_size)
-                if qty_api < min_qty:
-                    qty_api = min_qty
-                notional = qty_api * entry_price
-                if notional < min_notional:
-                    qty_api = quantize_qty(min_notional / entry_price, step_size)
+                    risk_amount = bal * dynamic_risk_pct
+                    qty = risk_amount / R
+                    qty_api = quantize_qty(qty, step_size)
+                    log(f"Risk: DD={float(drawdown*100):.2f}% → {float(dynamic_risk_pct*100):.3f}% | Qty={float(qty_api):.3f}", telegram_bot, telegram_chat_id)
+
 
                 sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
                 sl_price_f = float(sl_price_dec_quant)
