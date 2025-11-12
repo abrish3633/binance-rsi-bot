@@ -25,6 +25,7 @@ import websocket
 import json
 import queue
 import feedparser  # ← NEW
+import socket
 
 
 # ------------------- CONFIGURATION -------------------
@@ -84,6 +85,7 @@ MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 # CONFIG BINANCE NEWS
 ANN_API = "https://www.binance.com/gateway-api/v1/public/cms/article/list/query"
 ANN_HIGH_IMPACT = {"delist", "halt", "liquidation", "margin", "restriction", "regulatory"}
+ANN_API = "https://testnet.binancefuture.com/gateway-api/v1/public/cms/article/list/query"  # ← testnet
 ANN_BUFFER_MIN = 10
 SOL_KEYWORDS = {"SOL", "SOLANA", "SOLUSDT", "SOL/USDT"}
 
@@ -98,6 +100,7 @@ PNL_LOG_FILE = 'pnl_log.csv'
 pnl_data = []
 last_trade_date = None
 last_exit_candle_time = None
+socket.setdefaulttimeout(10)
 
 # ENHANCED: Thread-safe stop & order cancellation
 _stop_lock = threading.Lock()
@@ -348,6 +351,7 @@ def emergency_close_on_drawdown(client, symbol, bot, chat_id):
     log("DAILY DRAWDOWN EMERGENCY CLOSE TRIGGERED", bot, chat_id)
     _request_stop(symbol=symbol, telegram_bot=bot, telegram_chat_id=chat_id)
     telegram_post(bot, chat_id, "EMERGENCY SHUTDOWN – DRAWDOWN >4%")
+    
 # ------------------- PNL LOGGING -------------------
 def init_pnl_log():
     if not os.path.exists(PNL_LOG_FILE):
