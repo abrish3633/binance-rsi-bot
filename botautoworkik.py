@@ -1247,6 +1247,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
     trades_today = 0
     last_processed_time = 0
     trade_state = TradeState()
+    qty_api = None  # ← ADD THIS
     pending_entry = False
     filters = get_symbol_filters(client, symbol)
     step_size = filters['stepSize']
@@ -1417,7 +1418,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
             sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and (not use_volume_filter or curr_vol > vol_sma15))
 
-            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
+                        if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
                 last_processed_time = close_time
                 side_text = "BUY" if buy_signal else "SELL"
                 log(f"Signal on candle close -> {side_text}. Preparing entry.", telegram_bot, telegram_chat_id)
@@ -1430,8 +1431,9 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                 try:
                     mark_data = client.public_request("/fapi/v1/premiumIndex", {"symbol": symbol})
                     mark_price = Decimal(str(mark_data["markPrice"]))
-                    if abs(mark_price - entry_price) / entry_price > MAX_ENTRY_SLIPPAGE_PCT:
-                        log(f"ENTRY SKIPPED: Slippage {float(abs(mark_price - entry_price)/entry_price*100):.3f}% > {float(MAX_ENTRY_SLIPPAGE_PCT*100):.1f}%", telegram_bot, telegram_chat_id)
+                    slippage_pct = abs(mark_price - entry_price) / entry_price
+                    if slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+                        log(f"ENTRY SKIPPED: Slippage {float(slippage_pct*100):.3f}% > {float(MAX_ENTRY_SLIPPAGE_PCT*100):.1f}%", telegram_bot, telegram_chat_id)
                         pending_entry = False
                         continue
                 except Exception as e:
@@ -1456,21 +1458,24 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
                     trail_rounding = ROUND_UP
 
                 if R <= Decimal('0'):
+                    log("Invalid R (R <= 0). Skipping trade.", telegram_bot, telegram_chat_id)
                     pending_entry = False
                     time.sleep(1)
                     continue
-                # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===
-                    bal = fetch_balance(client)
-                    drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
-                    dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
-                    dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
 
-                    risk_amount = bal * dynamic_risk_pct
-                    qty = risk_amount / R
-                    qty_api = quantize_qty(qty, step_size)
-                    log(f"Risk: DD={float(drawdown*100):.2f}% → {float(dynamic_risk_pct*100):.3f}% | Qty={float(qty_api):.3f}", telegram_bot, telegram_chat_id)
+                # === DRAWDOWN-SCALED RISK (SOFT THROTTLE) ===  ← INDENTED CORRECTLY
+                bal = fetch_balance(client)
+                drawdown = max(Decimal('0'), (daily_start_equity - bal) / daily_start_equity)
+                dynamic_risk_pct = BASE_RISK_PCT * (Decimal('1') - drawdown / MAX_DRAWDOWN_PCT)
+                dynamic_risk_pct = max(dynamic_risk_pct, MIN_RISK_PCT)
 
+                risk_amount = bal * dynamic_risk_pct
+                qty = risk_amount / R
+                qty_api = quantize_qty(qty, step_size)
 
+                log(f"Risk: DD={float(drawdown*100):.2f}% → {float(dynamic_risk_pct*100):.3f}% | Qty={float(qty_api):.3f}", telegram_bot, telegram_chat_id)
+
+                # === PRICE LEVELS ===
                 sl_price_dec_quant = quantize_price(sl_price_dec, tick_size, sl_rounding)
                 sl_price_f = float(sl_price_dec_quant)
                 tp_price_dec_quant = quantize_price(tp_price_dec, tick_size, tp_rounding)
