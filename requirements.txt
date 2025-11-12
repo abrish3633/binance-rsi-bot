@@ -3,3 +3,4 @@ python-telegram-bot==21.4
 schedule==1.2.0
 websocket-client
 feedparser
+numpy
