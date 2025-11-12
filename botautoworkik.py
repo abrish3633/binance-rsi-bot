@@ -123,6 +123,7 @@ news_guard_was_active: bool = False
 _ann_cache = []
 _ann_ts = 0.0
 ANN_LOCK = False
+_last_news_block_reason = None
 # ---------------------------------------------------------------------------------------
 # 4. FETCHERS
 # ----------------------------------------------------------------------
@@ -270,28 +271,45 @@ def news_heartbeat():
 # ----------------------------------------------------------------------
 # 6. PUBLIC GUARD (called from trading loop)
 # ----------------------------------------------------------------------
+_last_news_block_reason = None  # ← MOVE TO TOP
+
 def is_news_blocked(now_utc: datetime | None = None) -> tuple[bool, str | None]:
+    global _last_news_block_reason
     now = now_utc or datetime.now(timezone.utc)
 
     with _news_lock:
-        # Economic
         for ev in _news_cache:
             if (ev["dt"] - timedelta(minutes=BUFFER_MINUTES) <= now <= 
                 ev["dt"] + timedelta(minutes=BUFFER_MINUTES)):
-                return True, f"Live: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+                reason = f"Live: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+                if reason != _last_news_block_reason:
+                    _last_news_block_reason = reason
+                return True, reason
 
-        # Binance Announcement
         for ev in _ann_cache:
             if (ev["dt"] - timedelta(minutes=ANN_BUFFER_MIN) <= now <= 
                 ev["dt"] + timedelta(minutes=ANN_BUFFER_MIN)):
-                return True, f"Binance: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+                reason = f"Binance: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+                if reason != _last_news_block_reason:
+                    _last_news_block_reason = reason
+                return True, reason
 
     blocked, reason = _in_blackout_window(now)
     if blocked:
+        if reason != _last_news_block_reason:
+            _last_news_block_reason = reason
         return True, reason
 
     if os.path.exists("FORCE_NO_TRADE_TODAY.txt"):
-        return True, "Manual override"
+        reason = "Manual override"
+        if reason != _last_news_block_reason:
+            _last_news_block_reason = reason
+        return True, reason
+
+    # === BLACKOUT ENDED ===
+    if _last_news_block_reason is not None:
+        log("NEWS GUARD -> All clear. Trading resumed.", telegram_bot, telegram_chat_id)
+        _last_news_block_reason = None
 
     return False, None
 
@@ -1356,8 +1374,11 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             is_green_candle = close_price > open_price
             is_red_candle = close_price < open_price
 
-            log(f"Candle close price={float(close_price):.4f} RSI={rsi} Vol={curr_vol:.2f} SMA15={(vol_sma15 or 0):.2f} {'Green' if is_green_candle else 'Red' if is_red_candle else 'Neutral'} candle", telegram_bot, telegram_chat_id)
-
+            # === SMART CANDLE LOG (ONLY ON CHANGE) ===
+            current_state = f"{close_price:.4f}|{rsi:.2f}|{curr_vol:.0f}|{vol_sma15:.2f}|{'G' if is_green_candle else 'R'}"
+            if not hasattr(trading_loop, "last_candle_state") or current_state != trading_loop.last_candle_state:
+                log(f"Candle: {close_price:.4f} RSI={rsi:.2f} Vol={curr_vol:.0f} SMA15={vol_sma15:.2f} {'Green' if is_green_candle else 'Red'}", telegram_bot, telegram_chat_id)
+                trading_loop.last_candle_state = current_state
             # === ENTRY GUARDS ===
             
             # === NEWS GUARD – MUST BE INSIDE THE LOOP ===
