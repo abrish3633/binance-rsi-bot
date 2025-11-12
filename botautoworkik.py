@@ -1418,7 +1418,7 @@ def trading_loop(client, symbol, timeframe, max_trades_per_day, risk_pct, max_da
             buy_signal = (rsi is not None and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and is_green_candle and (not use_volume_filter or curr_vol > vol_sma15))
             sell_signal = (rsi is not None and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and is_red_candle and (not use_volume_filter or curr_vol > vol_sma15))
 
-                        if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
+            if (buy_signal or sell_signal) and not trade_state.active and not pending_entry:
                 last_processed_time = close_time
                 side_text = "BUY" if buy_signal else "SELL"
                 log(f"Signal on candle close -> {side_text}. Preparing entry.", telegram_bot, telegram_chat_id)
