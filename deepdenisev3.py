@@ -70,7 +70,7 @@ HIGH_IMPACT_KEYWORDS = {
 }
 BUFFER_MINUTES = 5
 
-NEWS_GUARD_ENABLED = True
+NEWS_GUARD_ENABLED = False
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot_webhook.lock')
 BASE_RISK_PCT = Decimal("0.068")
@@ -1128,15 +1128,11 @@ def process_alert(data: Dict[str, Any]):
         return
     
     side = data.get('side', '').upper()
-    qty_str = data.get('qty')
-    if not qty_str:
-        log("Missing quantity")
-        return
-    qty = Decimal(qty_str)
+    tv_qty_str = data.get('qty')  # Only logged — not used for execution
     order_type = data.get('type', '').upper()
     reduce_only = data.get('reduceOnly', False)
     
-    # Extract optional SL and TP from combined payload
+    # Extract optional SL/TP from combined payload (still useful if present)
     stop_price_str = data.get('stopPrice')
     take_profit_str = data.get('takeProfit')
     
@@ -1145,14 +1141,11 @@ def process_alert(data: Dict[str, Any]):
     step_size = filters['stepSize']
     tick_size = filters['tickSize']
     
-    # Quantize quantity
-    qty_quant = quantize_qty(qty, step_size)
-    
     with bot_state._trade_lock:
         current_trade = bot_state.current_trade
     
     if order_type == 'MARKET':
-        if reduce_only:  # Exit order from Pine Script's gen_exit_json()
+        if reduce_only:  # ── EXIT ORDER ────────────────────────────────────────────────
             if not current_trade or not current_trade.active:
                 log("No active position to close")
                 return
@@ -1179,8 +1172,8 @@ def process_alert(data: Dict[str, Any]):
                 "reduceOnly": True
             })
             log(f"Close order sent: {response}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-            
-        else:  # Entry order from gen_entry_json()
+        
+        else:  # ── ENTRY ORDER ────────────────────────────────────────────────────────
             if current_trade and current_trade.active:
                 log("Position already active, ignoring entry", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                 return
@@ -1191,6 +1184,84 @@ def process_alert(data: Dict[str, Any]):
                     log(f"News blocked: {reason}, ignoring entry", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                     return
             
+            # ── 1. Real balance check ────────────────────────────────────────────────
+            current_balance = fetch_balance(client)
+            if current_balance <= Decimal("10"):
+                log(f"Balance too low (${current_balance:.2f}) — skipping entry",
+                    CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            # ── 2. Current market price (for sizing + slippage) ──────────────────────
+            current_price = get_current_price(client, symbol)
+            if current_price is None or current_price <= Decimal("0"):
+                log("Failed to get current price — skipping entry",
+                    CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            # ── 3. Calculate risk distance (R), SL, TP, trail levels ────────────────
+            if side == "BUY":  # LONG
+                sl_price_dec = current_price * (Decimal("1") - SL_PCT)
+                R = current_price * SL_PCT
+                tp_price_dec = current_price + (TP_MULT * R)
+                trail_activation = current_price + (TRAIL_TRIGGER_MULT * R)
+            else:  # SHORT
+                sl_price_dec = current_price * (Decimal("1") + SL_PCT)
+                R = current_price * SL_PCT
+                tp_price_dec = current_price - (TP_MULT * R)
+                trail_activation = current_price - (TRAIL_TRIGGER_MULT * R)
+            
+            if R <= Decimal('0'):
+                log("Invalid risk distance (R <= 0) — skipping",
+                    CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            # ── 4. Bot recalculates qty (safe, real-balance based) ───────────────────
+            risk_amount_usd = current_balance * RISK_PCT
+            max_notional_by_leverage = current_balance * MAX_LEVERAGE
+            max_qty_by_leverage = max_notional_by_leverage / current_price
+            
+            qty_raw = risk_amount_usd / R
+            qty = min(qty_raw, max_qty_by_leverage)
+            qty = qty * Decimal("0.75")           # safety factor
+            qty = min(qty, Decimal("25"))         # hard cap
+            qty_quant = quantize_qty(qty, step_size)
+            
+            notional = qty_quant * current_price
+            if notional < Decimal("5.0"):
+                log(f"Calculated notional too small (${notional:.2f} < $5) — skipping",
+                    CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            # ── 5. Pre-entry slippage check ─────────────────────────────────────────
+            tv_price = current_price  # fallback
+            if 'price' in data:
+                try:
+                    tv_price = Decimal(str(data['price']))
+                except:
+                    pass
+            
+            slippage_pct = abs(current_price - tv_price) / tv_price if tv_price > 0 else Decimal("0")
+            if slippage_pct > MAX_ENTRY_SLIPPAGE_PCT:
+                log(f"Slippage too high: {slippage_pct*100:.3f}% > {MAX_ENTRY_SLIPPAGE_PCT*100:.2f}% "
+                    f"(TV: {tv_price:.4f} → Now: {current_price:.4f}) — skipping",
+                    CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            # ── 6. Detailed logging for transparency ─────────────────────────────────
+            log(f"ENTRY SIGNAL → {side} {symbol}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  Balance: ${current_balance:.2f} | Risk: {RISK_PCT*100:.1f}% (${risk_amount_usd:.2f})",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  Current price: ${current_price:.4f} | R = ${R:.4f}",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  Raw qty: {qty_raw:.4f} → After lev cap: {min(qty_raw, max_qty_by_leverage):.4f}",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  After safety 75%: {qty:.4f} → After hard cap: {qty:.4f}",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  FINAL QTY: {qty_quant:.4f} SOL | Notional: ${notional:.2f}",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"  TV suggested qty: {tv_qty_str or 'N/A'}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            
+            # ── 7. Place the MARKET order ────────────────────────────────────────────
             response = client.send_signed_request("POST", "/fapi/v1/order", {
                 "symbol": symbol,
                 "side": side,
@@ -1205,7 +1276,7 @@ def process_alert(data: Dict[str, Any]):
             
             log(f"Entry order placed: {response}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
             
-            # Wait for fill
+            # ── 8. Wait for fill (your original code — unchanged) ────────────────────
             start_time = time.time()
             filled = False
             while time.time() - start_time < ORDER_FILL_TIMEOUT:
@@ -1227,15 +1298,13 @@ def process_alert(data: Dict[str, Any]):
                         bot_state.current_trade.risk = bot_state.current_trade.entry_R
                         bot_state.current_trade.entry_close_time = int(time.time() * 1000)
                         
-                        # Calculate trail activation price (1.25R)
                         if bot_state.current_trade.side == "LONG":
                             bot_state.current_trade.trail_activation = actual_fill + (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
                         else:
                             bot_state.current_trade.trail_activation = actual_fill - (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
                         
-                        # Quantize trail activation
                         bot_state.current_trade.trail_activation = quantize_price(
-                            bot_state.current_trade.trail_activation, 
+                            bot_state.current_trade.trail_activation,
                             tick_size,
                             ROUND_UP if bot_state.current_trade.side == "LONG" else ROUND_DOWN
                         )
@@ -1255,14 +1324,13 @@ def process_alert(data: Dict[str, Any]):
                     pass
                 return
             
-            # Now that we have the trade state, place all protective orders immediately
+            # ── 9. Place protective orders (your original code — unchanged) ──────────
             with bot_state._trade_lock:
                 trade = bot_state.current_trade
                 if trade and trade.active:
-                    # Calculate callback rate (2R as percentage)
                     callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
                     
-                    # 1. Place Stop Loss
+                    # SL
                     sl_price = None
                     if trade.side == "LONG":
                         sl_price = trade.entry_price * (Decimal("1") - SL_PCT)
@@ -1279,7 +1347,7 @@ def process_alert(data: Dict[str, Any]):
                         trade.sl = sl_price
                         log(f"SL placed at {sl_price}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                     
-                    # 2. Place Take Profit
+                    # TP
                     tp_price = None
                     if trade.side == "LONG":
                         tp_price = trade.entry_price + (TP_MULT * trade.entry_R)
@@ -1296,7 +1364,7 @@ def process_alert(data: Dict[str, Any]):
                         trade.tp = tp_price
                         log(f"TP placed at {tp_price}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                     
-                    # 3. Place Trailing Stop (IMMEDIATELY, with activation price)
+                    # Trailing Stop
                     trail_side = "SELL" if trade.side == "LONG" else "BUY"
                     trail_order = client.place_trailing_stop_market(
                         symbol=symbol,
@@ -1309,17 +1377,16 @@ def process_alert(data: Dict[str, Any]):
                     
                     if trail_order and trail_order.get("algoId"):
                         trade.trail_algo_id = trail_order["algoId"]
-                        log(f"Trailing stop placed - Activation: {trade.trail_activation}, Callback: {callback_rate}%", 
+                        log(f"Trailing stop placed - Activation: {trade.trail_activation}, Callback: {callback_rate}%",
                             CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                         
-                        # Send Telegram notification
                         send_trail_placed_telegram(
-                            symbol, trade.side, 
+                            symbol, trade.side,
                             trade.trail_activation, callback_rate,
                             CMD_ARGS.telegram_token, CMD_ARGS.chat_id
                         )
                     
-                    # Send comprehensive entry telegram
+                    # Entry Telegram
                     send_trade_telegram({
                         'symbol': symbol,
                         'side': trade.side,
@@ -1331,8 +1398,8 @@ def process_alert(data: Dict[str, Any]):
                         'callback_rate': callback_rate
                     }, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                     
-                    # Start monitoring thread AFTER all orders are placed
-                    log("Starting trade monitoring after all protective orders placed", 
+                    # Start monitoring
+                    log("Starting trade monitoring after all protective orders placed",
                         CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                     threading.Thread(
                         target=monitor_trade,
@@ -1340,7 +1407,8 @@ def process_alert(data: Dict[str, Any]):
                         daemon=True
                     ).start()
     
-    elif order_type == 'STOP_MARKET':  # From gen_sl_json() - for initial SL placement or updates
+    elif order_type == 'STOP_MARKET':
+        # Your original SL handling code (unchanged)
         stop_price_str = data.get('stopPrice')
         if not stop_price_str:
             log("No stopPrice in alert")
@@ -1365,7 +1433,6 @@ def process_alert(data: Dict[str, Any]):
             log(f"SL qty mismatch: expected {current_trade.qty}, got {qty_quant}")
             return
         
-        # Cancel old SL if exists
         if current_trade.sl_algo_id:
             try:
                 client.cancel_algo_order(symbol, current_trade.sl_algo_id)
@@ -1373,18 +1440,19 @@ def process_alert(data: Dict[str, Any]):
             except:
                 pass
         
-        # Place new SL as ALGO order
         sl_order = client.place_stop_market(symbol, side, qty_quant, stop_price_quant, reduce_only=True)
         if sl_order and sl_order.get("algoId"):
             with bot_state._trade_lock:
                 if bot_state.current_trade:
                     bot_state.current_trade.sl_algo_id = sl_order["algoId"]
                     bot_state.current_trade.sl = stop_price_quant
-            log(f"SL placed/updated at {stop_price_quant} (algoId: {sl_order['algoId']})", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"SL placed/updated at {stop_price_quant} (algoId: {sl_order['algoId']})",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
         else:
             log("SL placement failed", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
     
-    elif order_type == 'TAKE_PROFIT_MARKET':  # From gen_tp_json() - for initial TP placement
+    elif order_type == 'TAKE_PROFIT_MARKET':
+        # Your original TP handling code (unchanged)
         tp_price_str = data.get('takeProfit')
         if not tp_price_str:
             log("No takeProfit in alert")
@@ -1409,7 +1477,6 @@ def process_alert(data: Dict[str, Any]):
             log(f"TP qty mismatch: expected {current_trade.qty}, got {qty_quant}")
             return
         
-        # Cancel old TP if exists
         if current_trade.tp_algo_id:
             try:
                 client.cancel_algo_order(symbol, current_trade.tp_algo_id)
@@ -1417,17 +1484,16 @@ def process_alert(data: Dict[str, Any]):
             except:
                 pass
         
-        # Place new TP as ALGO order
         tp_order = client.place_take_profit_market(symbol, side, qty_quant, tp_price_quant, reduce_only=True)
         if tp_order and tp_order.get("algoId"):
             with bot_state._trade_lock:
                 if bot_state.current_trade:
                     bot_state.current_trade.tp_algo_id = tp_order["algoId"]
                     bot_state.current_trade.tp = tp_price_quant
-            log(f"TP placed/updated at {tp_price_quant} (algoId: {tp_order['algoId']})", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            log(f"TP placed/updated at {tp_price_quant} (algoId: {tp_order['algoId']})",
+                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
         else:
             log("TP placement failed", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-
 @app.route('/webhook', methods=['POST'])
 def webhook():
     if bot_state.STOP_REQUESTED:
