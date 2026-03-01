@@ -1,0 +1,1593 @@
+## FINAL PRODUCTION VERSION — ALL 22 FIXES + WS → POLLING FALLBACK + WEBHOOK INTEGRATION
+## FIXED: Trailing stop placed immediately at entry with correct callback rate
+import argparse
+import logging
+import time
+import hmac
+import hashlib
+import requests
+import os
+import signal
+import sys
+import csv
+import threading
+import traceback
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_EVEN
+from datetime import datetime, timezone, timedelta
+import schedule
+from urllib.parse import urlencode
+from typing import Optional, Tuple, Dict, Any, List
+import atexit
+import websocket
+import json
+import queue
+import socket
+import platform
+import numpy as np
+from flask import Flask, request, jsonify
+# ------------------- WEBHOOK SETUP -------------------
+app = Flask(__name__)
+my_uid = "6e8769164ae8eedf74dcaaeb86000f8e03d166bf5181f8eb283a4bb90e6574a2"
+
+# Global args for webhook access
+CMD_ARGS = None
+
+# ------------------- CONFIGURATION -------------------
+RISK_PCT = Decimal("0.068")
+SL_PCT = Decimal("0.0075")  # 0.75% from Pine Script
+TP_MULT = Decimal("9")
+TRAIL_TRIGGER_MULT = Decimal("1.25")  # Activate trailing after 1.25R profit
+TRAIL_DISTANCE_MULT = Decimal("2")    # Trail by 2R
+VOL_SMA_PERIOD = 16
+RSI_PERIOD = 14
+MAX_TRADES_PER_DAY = 1
+INTERVAL_DEFAULT = "45m"
+ORDER_FILL_TIMEOUT = 15
+POSITION_CHECK_INTERVAL = 60
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 5
+RECOVERY_CHECK_INTERVAL = 10
+POLLING_INTERVAL = 3
+
+# === CONFIG: BLACKOUT WINDOWS (UTC) ===
+NEWS_BLACKOUT_WINDOWS = [
+    (4, (12, 25), (13, 5)),  # Friday 12:30–13:00 UTC (NFP)
+    (2, (18, 55), (19, 35)),  # Wednesday 19:00–19:30 UTC (FOMC)
+]
+
+# === CONFIG: LIVE API ===
+LIVE_APIS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://ec.forexprostools.com/?columns=exc_currency,exc_type&timezone=utc"
+]
+LOCAL_CALENDAR = "high_impact_calendar.json"
+LOCAL_OVERRIDE = "news_calendar_override.json"
+CACHE_DURATION = 300
+HIGH_IMPACT_KEYWORDS = {
+    "NFP", "NONFARM", "CPI", "FOMC", "GDP", "UNEMPLOYMENT", "RATE DECISION",
+    "PCE", "CORE", "ISM", "JOLTS", "OPEC", "SNB", "BOJ", "GEOPOLITICAL",
+    "RETAIL SALES", "ADP", "FLASH", "PRELIMINARY"
+}
+BUFFER_MINUTES = 5
+
+NEWS_GUARD_ENABLED = True
+MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
+LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot_webhook.lock')
+BASE_RISK_PCT = Decimal("0.068")
+MAX_LEVERAGE = Decimal("9")
+ENABLE_WEEKLY_SCALING = True
+HALF_R_THRESHOLD = Decimal("0.00375")
+
+# ------------------- BOT STATE CLASS -------------------
+class BotState:
+    def __init__(self):
+        self.STOP_REQUESTED = False
+        self.client = None
+        self.symbol_filters_cache: Dict[str, Dict[str, Decimal]] = {}
+        self._position_closure_in_progress = False
+        
+        # PNL logging
+        self.PNL_LOG_FILE = 'pnl_log.csv'
+        self.pnl_data: List[Dict[str, Any]] = []
+        self.last_trade_date: Optional[datetime] = None
+        
+        # Thread-safe state
+        self._stop_lock = threading.Lock()
+        self._orders_cancelled = False
+        self._trade_lock = threading.Lock()
+        
+        # WebSocket state
+        self._ws_failed = False
+        self._polling_active = False
+        self._price_queue = queue.Queue()
+        
+        # News guard state
+        self._news_lock = threading.Lock()
+        self._news_cache: List[Dict[str, Any]] = []
+        self._cache_ts = Decimal("0.0")
+        self.NEWS_LOCK = False
+        self._last_news_block_reason: Optional[str] = None
+        
+        # Risk management
+        self.weekly_peak_equity: Optional[Decimal] = None
+        self.weekly_start_time: Optional[datetime] = None
+        self.CONSEC_LOSSES = 0
+        self.USE_CONSEC_LOSS_GUARD = True
+        self.MAX_CONSEC_LOSSES = 3
+        self.weekly_dd_alert_triggered = False
+        
+        # Trading state - SINGLE TRADE STATE
+        self.current_trade: Optional['TradeState'] = None
+        
+        self.is_testnet = True
+        self.consec_loss_guard_alert_sent = False
+        self.account_size: Optional[Decimal] = None
+
+bot_state = BotState()
+
+# ------------------- TRADE STATE WITH DECIMAL -------------------
+class TradeState:
+    def __init__(self):
+        self.active = False
+        self.entry_price: Optional[Decimal] = None
+        self.qty: Optional[Decimal] = None
+        self.side: Optional[str] = None
+        self.entry_close_time: Optional[int] = None
+        
+        # Order IDs
+        self.sl_algo_id: Optional[int] = None
+        self.tp_algo_id: Optional[int] = None
+        self.trail_algo_id: Optional[int] = None
+        
+        # Price levels
+        self.sl: Optional[Decimal] = None
+        self.tp: Optional[Decimal] = None
+        self.trail_activation: Optional[Decimal] = None  # Price at which trail activates (1.25R)
+        self.current_trail_stop: Optional[Decimal] = None
+        
+        # Trail tracking
+        self.trail_activated = False  # Will be managed by Binance, but we track for info
+        self.entry_R: Optional[Decimal] = None  # R value for calculations
+        
+        # Risk
+        self.risk: Optional[Decimal] = None
+
+# ------------------- SINGLE INSTANCE LOCK -------------------
+def acquire_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            try:
+                with open(LOCK_FILE, 'r') as f:
+                    pid_str = f.read().strip()
+                    if pid_str and pid_str.isdigit():
+                        pid = int(pid_str)
+                        if platform.system() == "Windows":
+                            import psutil
+                            try:
+                                psutil.Process(pid)
+                                print("Another instance is already running! Exiting.")
+                                sys.exit(1)
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                os.unlink(LOCK_FILE)
+                        else:
+                            try:
+                                os.kill(pid, 0)
+                                print("Another instance is already running! Exiting.")
+                                sys.exit(1)
+                            except OSError:
+                                os.unlink(LOCK_FILE)
+            except:
+                try:
+                    os.unlink(LOCK_FILE)
+                except:
+                    pass
+        
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+        
+        if platform.system() != "Windows":
+            try:
+                import fcntl
+                lock_handle = open(LOCK_FILE, 'r+')
+                fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_handle
+            except Exception as e:
+                print(f"Failed to acquire file lock: {e}")
+                sys.exit(1)
+        return None
+    except:
+        return None
+
+LOCK_HANDLE = acquire_lock()
+
+# ------------------- MEMORY CHECK -------------------
+try:
+    import psutil
+    mem_mb = psutil.Process().memory_info().rss / 1024**2
+    print(f"[Startup] Initial memory usage: {mem_mb:.1f} MB")
+except:
+    pass
+
+# ------------------- FETCHERS & HELPERS -------------------
+def get_server_time(client):
+    try:
+        resp = client.public_request("/fapi/v1/time")
+        return int(resp['serverTime'])
+    except Exception as e:
+        log(f"Server time fetch failed: {e}")
+        return int(time.time() * 1000)
+
+def _fetch_json(url: str) -> List[Any] | None:
+    try:
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        return None
+    return None
+
+def _load_local_calendar() -> List[Any]:
+    if os.path.exists(LOCAL_CALENDAR):
+        try:
+            with open(LOCAL_CALENDAR) as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def _load_override() -> List[Any]:
+    if os.path.exists(LOCAL_OVERRIDE):
+        try:
+            with open(LOCAL_OVERRIDE) as f:
+                return json.load(f)
+        except:
+            pass
+    return []
+
+def _parse_event(event: Dict[str, Any]) -> Optional[datetime]:
+    dt_str = event.get("date") or event.get("timestamp")
+    if not dt_str:
+        return None
+    try:
+        if isinstance(dt_str, (int, float)):
+            return datetime.fromtimestamp(dt_str, tz=timezone.utc)
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except:
+        return None
+
+def _time_in_window(now_utc: datetime, start_hm: Tuple[int, int], end_hm: Tuple[int, int]) -> bool:
+    start = datetime(now_utc.year, now_utc.month, now_utc.day, *start_hm, tzinfo=timezone.utc)
+    end = datetime(now_utc.year, now_utc.month, now_utc.day, *end_hm, tzinfo=timezone.utc)
+    if end <= start:
+        end += timedelta(days=1)
+    return start <= now_utc <= end
+
+def _in_blackout_window(now_utc: Optional[datetime] = None) -> Tuple[bool, Optional[str]]:
+    now = now_utc or datetime.now(timezone.utc)
+    for wd, start, end in NEWS_BLACKOUT_WINDOWS:
+        if wd is None or wd == now.weekday():
+            if _time_in_window(now, start, end):
+                return True, f"Blackout: {start}–{end} UTC"
+    return False, None
+
+# ------------------- NEWS HEARTBEAT -------------------
+def _refresh_news():
+    global bot_state
+    now = datetime.now(timezone.utc)
+    events: List[Dict[str, Any]] = []
+    for api in LIVE_APIS:
+        data = _fetch_json(api)
+        if data:
+            events.extend(data)
+            break
+    events.extend(_load_local_calendar())
+    events.extend(_load_override())
+    high: List[Dict[str, Any]] = []
+    for e in events:
+        title = (e.get("title") or e.get("event") or "").upper()
+        impact = (e.get("impact") or "").lower()
+        if impact != "high" and not any(k in title for k in HIGH_IMPACT_KEYWORDS):
+            continue
+        dt = _parse_event(e)
+        if dt:
+            high.append({"dt": dt, "title": title})
+    with bot_state._news_lock:
+        bot_state._news_cache = high
+        bot_state._cache_ts = Decimal(str(time.time()))
+
+def news_heartbeat():
+    global bot_state
+    while not bot_state.STOP_REQUESTED:
+        _refresh_news()
+        now = datetime.now(timezone.utc)
+        news_lock = False
+        with bot_state._news_lock:
+            for ev in bot_state._news_cache:
+                if (ev["dt"] - timedelta(minutes=BUFFER_MINUTES) <= now <=
+                    ev["dt"] + timedelta(minutes=BUFFER_MINUTES)):
+                    news_lock = True
+                    break
+        static_block, _ = _in_blackout_window(now)
+        bot_state.NEWS_LOCK = news_lock or static_block
+        time.sleep(60)
+
+def is_news_blocked(now_utc: Optional[datetime] = None) -> Tuple[bool, Optional[str]]:
+    global bot_state
+    now = now_utc or datetime.now(timezone.utc)
+    with bot_state._news_lock:
+        for ev in bot_state._news_cache:
+            if (ev["dt"] - timedelta(minutes=BUFFER_MINUTES) <= now <=
+                ev["dt"] + timedelta(minutes=BUFFER_MINUTES)):
+                return True, f"Live: {ev['title']} @ {ev['dt'].strftime('%H:%M')} UTC"
+    blocked, reason = _in_blackout_window(now)
+    if blocked:
+        return True, reason
+    if os.path.exists("FORCE_NO_TRADE_TODAY.txt"):
+        return True, "Manual override"
+    return False, None
+
+# ------------------- LOGGING -------------------
+class CustomFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + '+00:00'
+
+logger = logging.getLogger()
+logger.handlers.clear()
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+logger.addHandler(console_handler)
+file_handler = logging.FileHandler('bot_webhook.log')  # Instead of 'bot.log'
+file_handler.setFormatter(CustomFormatter(fmt='[%(asctime)s] %(message)s'))
+logger.addHandler(file_handler)
+
+def log(message: str, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
+    try:
+        logger.info(message)
+    except:
+        print(f"[LOG-FAIL] {message[:200]}")
+    if telegram_bot and telegram_chat_id:
+        telegram_post(telegram_bot, telegram_chat_id, message)
+
+# ------------------- TELEGRAM -------------------
+def telegram_post(token: Optional[str], chat_id: Optional[str], text: str, parse_mode: Optional[str] = None):
+    if not token or not chat_id or ':' not in token:
+        return
+    try:
+        if len(text) > 4000:
+            text = text[:3900] + "\n...[truncated]"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=(3, 5))
+    except:
+        pass
+
+def send_trade_telegram(trade_details: Dict[str, Any], bot: Optional[str], chat_id: Optional[str]):
+    message = (
+        f"✅ NEW POSITION\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{trade_details['side']} {trade_details['symbol']}\n"
+        f"Entry: {trade_details.get('entry', 'N/A'):.4f}\n"
+        f"Qty: {trade_details['qty']:.3f}\n"
+        f"SL: {trade_details.get('sl', 'N/A'):.4f}\n"
+        f"TP: {trade_details.get('tp', 'N/A'):.4f}\n"
+        f"Trail Activation: {trade_details.get('trail_activation', 'N/A'):.4f}\n"
+        f"Callback Rate: {trade_details.get('callback_rate', 'N/A')}%\n"
+        f"━━━━━━━━━━━━━━━━"
+    )
+    telegram_post(bot, chat_id, message)
+
+def send_closure_telegram(symbol: str, side: str, entry_price: Decimal, exit_price: Decimal, qty: Decimal, pnl_usd: Decimal, pnl_r: Decimal, reason: str, bot: Optional[str], chat_id: Optional[str]):
+    global bot_state
+    message = (
+        f"🔚 POSITION CLOSED\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"{side} {symbol}\n"
+        f"Entry: {entry_price:.4f}\n"
+        f"Exit: {exit_price:.4f}\n"
+        f"Reason: {reason}\n"
+        f"PnL: ${pnl_usd:.2f} ({pnl_r:.2f}R)\n"
+        f"Loss Streak: {bot_state.CONSEC_LOSSES}\n"
+        f"━━━━━━━━━━━━━━━━"
+    )
+    telegram_post(bot, chat_id, message)
+
+def send_trail_placed_telegram(symbol: str, side: str, activation: Decimal, callback: Decimal, bot: Optional[str], chat_id: Optional[str]):
+    message = (
+        f"🔄 TRAILING STOP PLACED\n"
+        f"{side} {symbol}\n"
+        f"Activation: {activation:.4f} ({TRAIL_TRIGGER_MULT}R)\n"
+        f"Callback: {callback:.2f}% ({TRAIL_DISTANCE_MULT}R)"
+    )
+    telegram_post(bot, chat_id, message)
+
+# ------------------- PNL LOGGING -------------------
+PNL_FIELDS = ['date', 'trade_id', 'side', 'entry', 'exit', 'pnl_usd', 'pnl_r', 'loss_streak']
+
+def init_pnl_log():
+    if not os.path.exists(bot_state.PNL_LOG_FILE):
+        with open(bot_state.PNL_LOG_FILE, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
+            writer.writeheader()
+
+def log_pnl(trade_id: int, side: str, entry: Decimal, exit_price: Decimal, qty: Decimal, R: Decimal) -> Dict[str, Any]:
+    global bot_state
+    if side == 'LONG':
+        pnl_usd = (exit_price - entry) * qty
+    else:
+        pnl_usd = (entry - exit_price) * qty
+    
+    total_risk = qty * R
+    if total_risk > Decimal("0"):
+        pnl_r = pnl_usd / total_risk
+    else:
+        pnl_r = Decimal("0") if pnl_usd >= Decimal("0") else Decimal("-1")
+    
+    denominator = entry * qty if entry and qty else Decimal("1")
+    loss_pct = abs(pnl_usd) / denominator if pnl_usd < Decimal("0") else Decimal("0")
+    is_full_loss = loss_pct >= Decimal("0.0074")
+    
+    if pnl_usd < Decimal("0") and is_full_loss:
+        bot_state.CONSEC_LOSSES += 1
+    else:
+        bot_state.CONSEC_LOSSES = 0
+    
+    row = {
+        'date': datetime.now(timezone.utc).isoformat(),
+        'trade_id': trade_id,
+        'side': side,
+        'entry': float(entry),
+        'exit': float(exit_price),
+        'pnl_usd': float(pnl_usd),
+        'pnl_r': float(pnl_r),
+        'loss_streak': bot_state.CONSEC_LOSSES
+    }
+    
+    bot_state.pnl_data.append(row)
+    
+    with open(bot_state.PNL_LOG_FILE, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=PNL_FIELDS)
+        writer.writerow(row)
+    
+    return row
+
+# ------------------- STOP HANDLER -------------------
+def _request_stop(signum: Optional[int] = None, frame: Any = None, symbol: Optional[str] = None, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None):
+    global bot_state
+    with bot_state._stop_lock:
+        if bot_state.STOP_REQUESTED:
+            logger.info("Stop already requested; skipping duplicate cleanup.")
+            return
+        bot_state.STOP_REQUESTED = True
+    
+    bot_state._position_closure_in_progress = True
+    log("Stop requested. Closing positions and cancelling orders...", telegram_bot, telegram_chat_id)
+    
+    if not bot_state.client or not symbol:
+        log("Client or symbol not defined; skipping position closure.", telegram_bot, telegram_chat_id)
+        bot_state._position_closure_in_progress = False
+        return
+    
+    try:
+        with bot_state._trade_lock:
+            if bot_state.current_trade and bot_state.current_trade.active:
+                pos_amt = get_position_amt(bot_state.client, symbol)
+                if pos_amt != Decimal('0'):
+                    side = "SELL" if pos_amt > Decimal('0') else "BUY"
+                    qty = abs(pos_amt)
+                    entry_price_dec = bot_state.current_trade.entry_price or Decimal('0')
+                    
+                    response = bot_state.client.send_signed_request("POST", "/fapi/v1/order", {
+                        "symbol": symbol,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": str(qty)
+                    })
+                    log(f"Closed position: qty={qty} {side}", telegram_bot, telegram_chat_id)
+                    
+                    exit_price_dec = None
+                    if response.get("orderId"):
+                        time.sleep(0.8)
+                        try:
+                            trades = bot_state.client.send_signed_request("GET", "/fapi/v1/userTrades", {
+                                "symbol": symbol,
+                                "orderId": response["orderId"],
+                                "limit": 10
+                            })
+                            if trades and len(trades) > 0:
+                                exit_price_dec = Decimal(str(trades[-1]["price"]))
+                        except:
+                            pass
+                    
+                    if exit_price_dec is None:
+                        ticker = bot_state.client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                        exit_price_dec = Decimal(str(ticker.get("price", "0")))
+                    
+                    pnl_row = log_pnl(
+                        len(bot_state.pnl_data) + 1,
+                        bot_state.current_trade.side or "UNKNOWN",
+                        entry_price_dec,
+                        exit_price_dec,
+                        qty,
+                        entry_price_dec * SL_PCT
+                    )
+                    
+                    send_closure_telegram(
+                        symbol=symbol,
+                        side=bot_state.current_trade.side or "UNKNOWN",
+                        entry_price=entry_price_dec,
+                        exit_price=exit_price_dec,
+                        qty=qty,
+                        pnl_usd=Decimal(str(pnl_row['pnl_usd'])),
+                        pnl_r=Decimal(str(pnl_row['pnl_r'])),
+                        reason="Stop Requested",
+                        bot=telegram_bot,
+                        chat_id=telegram_chat_id
+                    )
+                    
+                    bot_state.current_trade.active = False
+    except Exception as e:
+        log(f"Stop handler error: {str(e)}", telegram_bot, telegram_chat_id)
+    
+    with bot_state._stop_lock:
+        if not bot_state._orders_cancelled:
+            try:
+                bot_state.client.cancel_all_open_orders(symbol)
+                log(f"All open orders cancelled for {symbol}.", telegram_bot, telegram_chat_id)
+            except Exception as e:
+                log(f"Failed to cancel open orders: {e}", telegram_bot, telegram_chat_id)
+            bot_state._orders_cancelled = True
+    bot_state._position_closure_in_progress = False
+
+# ------------------- BINANCE CLIENT WITH ALGO ORDERS -------------------
+class BinanceAPIError(Exception):
+    def __init__(self, message: str, status_code: Optional[int] = None, payload: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.payload = payload
+
+class BinanceClient:
+    def __init__(self, api_key: str, api_secret: str, use_live: bool = False, base_override: Optional[str] = None):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.use_live = use_live
+        self.base = base_override or ("https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com")
+        log(f"Using base URL: {self.base}")
+    
+    def set_leverage(self, symbol: str, leverage: int):
+        params = {"symbol": symbol, "leverage": leverage}
+        return self.send_signed_request("POST", "/fapi/v1/leverage", params)
+    
+    def _sign(self, query_string: str) -> str:
+        return hmac.new(self.api_secret.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+    
+    def send_signed_request(self, method: str, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        params = params.copy() if params else {}
+        params["timestamp"] = get_server_time(self)
+        params["recvWindow"] = 60000
+        
+        query = urlencode({k: str(params[k]) for k in sorted(params.keys())})
+        signature = self._sign(query)
+        url = f"{self.base}{endpoint}?{query}&signature={signature}"
+        headers = {"X-MBX-APIKEY": self.api_key}
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.request(method, url, headers=headers, timeout=REQUEST_TIMEOUT)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code in (429, 503):
+                    wait = (2 ** attempt) * 10
+                    log(f"Rate limited. Retry in {wait}s")
+                    time.sleep(wait)
+                    continue
+                raise BinanceAPIError(f"HTTP {r.status_code}: {r.text}", r.status_code, r.text)
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < MAX_RETRIES - 1:
+                    wait = (2 ** attempt) * 5
+                    time.sleep(wait)
+                    continue
+                raise BinanceAPIError(f"Network failed after {MAX_RETRIES} retries: {str(e)}")
+            except Exception as e:
+                raise BinanceAPIError(f"Request failed: {str(e)}", payload=str(e))
+        
+        raise BinanceAPIError("Max retries exceeded")
+    
+    def public_request(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        url = f"{self.base}{path}"
+        try:
+            r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                return r.json()
+            else:
+                raise BinanceAPIError(f"HTTP {r.status_code}: {r.text}", r.status_code, r.text)
+        except Exception as e:
+            raise BinanceAPIError(f"Public request failed: {str(e)}", payload=str(e))
+    
+    def get_latest_trade_details(self, symbol: str) -> Optional[Dict[str, Any]]:
+        params = {"symbol": symbol, "limit": 1}
+        try:
+            response = self.send_signed_request("GET", "/fapi/v1/userTrades", params)
+            trades = response if isinstance(response, list) else []
+            if trades:
+                trade = trades[0]
+                return {
+                    "price": Decimal(str(trade.get("price", "0"))),
+                    "orderId": trade.get("orderId"),
+                    "qty": Decimal(str(trade.get("qty", "0"))),
+                    "side": trade.get("side")
+                }
+            return None
+        except:
+            return None
+    
+    def get_open_orders(self, symbol: str) -> List[Any]:
+        params = {"symbol": symbol}
+        response = self.send_signed_request("GET", "/fapi/v1/openOrders", params)
+        return response if isinstance(response, list) else []
+    
+    def get_open_algo_orders(self, symbol: str) -> List[Any]:
+        """Get open algo orders (STOP_MARKET, TAKE_PROFIT_MARKET, TRAILING_STOP_MARKET)"""
+        try:
+            response = self.send_signed_request("GET", "/fapi/v1/openAlgoOrders", {"symbol": symbol})
+            return response if isinstance(response, list) else []
+        except:
+            return []
+    
+    def cancel_all_open_orders(self, symbol: str):
+        """Cancel all regular and algo orders"""
+        try:
+            # Cancel regular orders
+            self.send_signed_request("DELETE", "/fapi/v1/allOpenOrders", {"symbol": symbol, "recvWindow": 60000})
+            log(f"[ZOMBIE KILLER] Regular orders cancelled for {symbol}")
+            
+            # Cancel algo orders
+            try:
+                algo_orders = self.get_open_algo_orders(symbol)
+                for order in algo_orders:
+                    algo_id = order.get("algoId")
+                    if algo_id:
+                        self.send_signed_request("DELETE", "/fapi/v1/algoOrder", {
+                            "symbol": symbol,
+                            "algoId": str(algo_id)
+                        })
+                        time.sleep(0.1)
+                if algo_orders:
+                    log(f"[ZOMBIE KILLER] Cancelled {len(algo_orders)} algo orders")
+            except:
+                pass
+        except:
+            pass
+    
+    def cancel_algo_order(self, symbol: str, algo_id: int) -> Any:
+        """Cancel a specific algo order"""
+        params = {"symbol": symbol, "algoId": str(algo_id)}
+        return self.send_signed_request("DELETE", "/fapi/v1/algoOrder", params)
+    
+    def get_latest_fill_price(self, symbol: str, order_id: int) -> Optional[Decimal]:
+        params = {"symbol": symbol, "orderId": order_id}
+        try:
+            trades = self.send_signed_request("GET", "/fapi/v1/userTrades", params)
+            if trades and len(trades) > 0:
+                return Decimal(str(trades[-1].get("price", "0")))
+            return None
+        except:
+            return None
+    
+    # ========== ALGO ORDER PLACEMENT ==========
+    
+    def place_algo_order(self, symbol: str, side: str, quantity: Decimal,
+                         order_type: str, trigger_price: Optional[Decimal] = None,
+                         activation_price: Optional[Decimal] = None, callback_rate: Optional[Decimal] = None,
+                         reduce_only: bool = True) -> Any:
+        params = {
+            "algoType": "CONDITIONAL",
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,  # ← FIXED: lowercase 't' — this was the bug
+            "quantity": str(quantity),
+            "reduceOnly": "true" if reduce_only else "false",
+            "timeInForce": "GTE_GTC",
+            "priceProtect": "true"  # Add this
+        }
+        
+        if trigger_price is not None:
+            params["triggerPrice"] = str(trigger_price)  # ← Docs confirm: triggerPrice for SL/TP
+            params["workingType"] = "CONTRACT_PRICE"
+        if activation_price is not None:
+            params["activatePrice"] = str(activation_price)
+        if callback_rate is not None:
+            params["callbackRate"] = str(callback_rate)
+        
+        return self.send_signed_request("POST", "/fapi/v1/algoOrder", params)
+    
+    def place_stop_market(self, symbol: str, side: str, quantity: Decimal, 
+                          stop_price: Decimal, reduce_only: bool = True) -> Any:
+        """Place STOP_MARKET algo order"""
+        return self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type="STOP_MARKET",
+            trigger_price=stop_price,
+            reduce_only=reduce_only
+        )
+    
+    def place_take_profit_market(self, symbol: str, side: str, quantity: Decimal,
+                                 stop_price: Decimal, reduce_only: bool = True) -> Any:
+        """Place TAKE_PROFIT_MARKET algo order"""
+        return self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type="TAKE_PROFIT_MARKET",
+            trigger_price=stop_price,
+            reduce_only=reduce_only
+        )
+    
+    def place_trailing_stop_market(self, symbol: str, side: str, quantity: Decimal,
+                                   activation_price: Decimal, callback_rate: Decimal,
+                                   reduce_only: bool = True) -> Any:
+        """Place TRAILING_STOP_MARKET algo order"""
+        return self.place_algo_order(
+            symbol=symbol,
+            side=side,
+            quantity=quantity,
+            order_type="TRAILING_STOP_MARKET",
+            activation_price=activation_price,
+            callback_rate=callback_rate,
+            reduce_only=reduce_only
+        )
+
+# ------------------- SYMBOL FILTERS -------------------
+def get_symbol_filters(client: BinanceClient, symbol: str) -> Dict[str, Decimal]:
+    global bot_state
+    if symbol in bot_state.symbol_filters_cache:
+        return bot_state.symbol_filters_cache[symbol]
+    
+    info = client.public_request("/fapi/v1/exchangeInfo")
+    s = next((x for x in info.get("symbols", []) if x.get("symbol") == symbol.upper()), None)
+    if not s:
+        raise ValueError(f"{symbol} not found")
+    
+    filters = {f["filterType"]: f for f in s.get("filters", [])}
+    lot = filters.get("LOT_SIZE")
+    if not lot:
+        raise ValueError("LOT_SIZE filter missing")
+    
+    step_size = Decimal(str(lot["stepSize"]))
+    tick_size = Decimal(str(filters.get("PRICE_FILTER", {}).get("tickSize", "0.00000001")))
+    
+    bot_state.symbol_filters_cache[symbol] = {
+        "stepSize": step_size,
+        "tickSize": tick_size
+    }
+    return bot_state.symbol_filters_cache[symbol]
+
+def quantize_qty(qty: Decimal, step_size: Decimal) -> Decimal:
+    q = (qty // step_size) * step_size
+    return q if q > Decimal("0") else step_size
+
+def quantize_price(p: Decimal, tick_size: Decimal, rounding=ROUND_HALF_EVEN) -> Decimal:
+    return p.quantize(tick_size, rounding=rounding)
+
+# ------------------- POSITION HELPERS -------------------
+def fetch_balance(client: BinanceClient) -> Decimal:
+    try:
+        data = client.send_signed_request("GET", "/fapi/v2/account")
+        return Decimal(str(data.get("totalWalletBalance", "0")))
+    except:
+        return Decimal("0")
+
+def get_position_amt(client: BinanceClient, symbol: str) -> Decimal:
+    try:
+        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        positions = pos_resp if isinstance(pos_resp, list) else pos_resp.get('data', []) if isinstance(pos_resp, dict) else []
+        for p in positions:
+            if p.get('symbol') == symbol:
+                return Decimal(str(p.get('positionAmt', '0')))
+        return Decimal('0')
+    except:
+        return Decimal('0')
+
+def has_active_position(client: BinanceClient, symbol: str) -> bool:
+    return get_position_amt(client, symbol) != Decimal('0')
+
+def fetch_open_positions_details(client: BinanceClient, symbol: str) -> Optional[Dict[str, Any]]:
+    try:
+        pos_resp = client.send_signed_request("GET", "/fapi/v2/positionRisk", {"symbol": symbol})
+        positions = pos_resp if isinstance(pos_resp, list) else pos_resp.get('data', []) if isinstance(pos_resp, dict) else []
+        for p in positions:
+            if p.get("symbol") == symbol:
+                return p
+        return None
+    except:
+        return None
+
+def get_current_price(client: BinanceClient, symbol: str) -> Optional[Decimal]:
+    try:
+        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+        return Decimal(str(ticker.get("price", "0")))
+    except:
+        return None
+
+# ------------------- RECOVERY FUNCTIONS -------------------
+def debug_and_recover_expired_orders(client: BinanceClient, symbol: str, trade_state: TradeState, tick_size: Decimal, telegram_bot: Optional[str] = None, telegram_chat_id: Optional[str] = None) -> bool:
+    global bot_state
+    if bot_state._position_closure_in_progress or not trade_state.active:
+        return False
+    
+    try:
+        pos_amt = get_position_amt(client, symbol)
+        if pos_amt == Decimal("0"):
+            return False
+        
+        # Get open algo orders
+        algo_orders = client.get_open_algo_orders(symbol)
+        open_algo_ids = {o.get("algoId") for o in algo_orders if o.get("algoId")}
+        
+        recovered = False
+        
+        # Recover SL
+        if trade_state.sl_algo_id and trade_state.sl_algo_id not in open_algo_ids and trade_state.sl:
+            log(f"SL missing. Re-issuing...", telegram_bot, telegram_chat_id)
+            close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+            new_sl = client.place_stop_market(symbol, close_side, trade_state.qty, trade_state.sl, reduce_only=True)
+            if new_sl and new_sl.get("algoId"):
+                trade_state.sl_algo_id = new_sl["algoId"]
+                log(f"SL RECOVERED - algoId: {trade_state.sl_algo_id}", telegram_bot, telegram_chat_id)
+                recovered = True
+        
+        # Recover TP
+        if trade_state.tp_algo_id and trade_state.tp_algo_id not in open_algo_ids and trade_state.tp:
+            log(f"TP missing. Re-issuing...", telegram_bot, telegram_chat_id)
+            close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+            new_tp = client.place_take_profit_market(symbol, close_side, trade_state.qty, trade_state.tp, reduce_only=True)
+            if new_tp and new_tp.get("algoId"):
+                trade_state.tp_algo_id = new_tp["algoId"]
+                log(f"TP RECOVERED - algoId: {trade_state.tp_algo_id}", telegram_bot, telegram_chat_id)
+                recovered = True
+        
+        # Recover Trailing Stop
+        if trade_state.trail_algo_id and trade_state.trail_algo_id not in open_algo_ids and trade_state.trail_activation:
+            log(f"Trailing stop missing. Re-issuing...", telegram_bot, telegram_chat_id)
+            close_side = "SELL" if trade_state.side == "LONG" else "BUY"
+            callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+            new_trail = client.place_trailing_stop_market(
+                symbol, close_side, trade_state.qty,
+                activation_price=trade_state.trail_activation,
+                callback_rate=callback_rate,
+                reduce_only=True
+            )
+            if new_trail and new_trail.get("algoId"):
+                trade_state.trail_algo_id = new_trail["algoId"]
+                log(f"TRAILING STOP RECOVERED - algoId: {trade_state.trail_algo_id}", telegram_bot, telegram_chat_id)
+                recovered = True
+        
+        return recovered
+    except Exception as e:
+        log(f"Recovery failed: {e}", telegram_bot, telegram_chat_id)
+        return False
+
+# ------------------- MONITOR TRADE -------------------
+def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, tick_size: Decimal, telegram_bot: Optional[str], telegram_chat_id: Optional[str]):
+    global bot_state
+    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
+    last_recovery_check = Decimal("0")
+    
+    # WebSocket setup for price feed
+    ws = None
+    ws_running = False
+    price_queue = queue.Queue()
+    
+    def on_open(ws_app):
+        try:
+            subscribe_msg = {
+                "method": "SUBSCRIBE",
+                "params": [f"{symbol.lower()}@trade"],
+                "id": 1
+            }
+            ws_app.send(json.dumps(subscribe_msg))
+            log(f"WebSocket subscribed to {symbol} trade stream", telegram_bot, telegram_chat_id)
+        except Exception as e:
+            log(f"WS subscribe failed: {e}", telegram_bot, telegram_chat_id)
+
+    def on_message(ws_app, message):
+        try:
+            data = json.loads(message)
+            if data.get('e') == 'trade' and 'p' in data:
+                price = Decimal(str(data['p']))
+                if price > 0 and price < Decimal('1000'):
+                    price_queue.put(price)
+        except:
+            pass
+
+    def on_error(ws_app, error):
+        if not bot_state._ws_failed:
+            log(f"WebSocket error, switching to polling", telegram_bot, telegram_chat_id)
+            bot_state._ws_failed = True
+
+    def start_ws():
+        nonlocal ws, ws_running
+        if ws_running:
+            return
+        base_url = "wss://fstream.binance.com/ws" if client.use_live else "wss://stream.binancefuture.com/ws"
+        ws = websocket.WebSocketApp(
+            base_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error
+        )
+        def run_ws():
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        threading.Thread(target=run_ws, daemon=True).start()
+        ws_running = True
+        time.sleep(1)  # Give connection time to establish
+
+    start_ws()
+    
+    while trade_state.active and not bot_state.STOP_REQUESTED:
+        try:
+            # Recovery check
+            if Decimal(str(time.time())) - last_recovery_check >= Decimal(str(RECOVERY_CHECK_INTERVAL)):
+                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, telegram_bot, telegram_chat_id)
+                last_recovery_check = Decimal(str(time.time()))
+            
+            # Position check
+            pos_amt = get_position_amt(client, symbol)
+            
+            if pos_amt == Decimal('0') and trade_state.active:
+                if bot_state._position_closure_in_progress:
+                    trade_state.active = False
+                    return
+                
+                log("Position closed. Determining exit details...", telegram_bot, telegram_chat_id)
+                trade_state.active = False
+                time.sleep(1.2)
+                
+                reason = "Unknown"
+                exit_price_dec = None
+                
+                try:
+                    algo_orders = client.get_open_algo_orders(symbol)
+                    open_algo_ids = {o.get("algoId") for o in algo_orders if o.get("algoId")}
+                    
+                    triggered_id = None
+                    if trade_state.sl_algo_id and trade_state.sl_algo_id not in open_algo_ids:
+                        reason = "Stop Loss"
+                        triggered_id = trade_state.sl_algo_id
+                    elif trade_state.tp_algo_id and trade_state.tp_algo_id not in open_algo_ids:
+                        reason = "Take Profit"
+                        triggered_id = trade_state.tp_algo_id
+                    elif trade_state.trail_algo_id and trade_state.trail_algo_id not in open_algo_ids:
+                        reason = "Trailing Stop"
+                        triggered_id = trade_state.trail_algo_id
+                    
+                    if triggered_id:
+                        exit_price_dec = client.get_latest_fill_price(symbol, triggered_id)
+                except:
+                    pass
+                
+                if exit_price_dec is None:
+                    latest = client.get_latest_trade_details(symbol)
+                    if latest and latest.get("price"):
+                        exit_price_dec = Decimal(str(latest["price"]))
+                    else:
+                        ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                        exit_price_dec = Decimal(str(ticker.get("price", "0")))
+                
+                entry_price_safe = trade_state.entry_price or Decimal("0")
+                R = entry_price_safe * SL_PCT
+                pnl_row = log_pnl(
+                    len(bot_state.pnl_data) + 1,
+                    trade_state.side or "UNKNOWN",
+                    entry_price_safe,
+                    exit_price_dec,
+                    trade_state.qty or Decimal("0"),
+                    R
+                )
+                
+                send_closure_telegram(
+                    symbol=symbol,
+                    side=trade_state.side or "UNKNOWN",
+                    entry_price=entry_price_safe,
+                    exit_price=exit_price_dec,
+                    qty=trade_state.qty or Decimal("0"),
+                    pnl_usd=Decimal(str(pnl_row['pnl_usd'])),
+                    pnl_r=Decimal(str(pnl_row['pnl_r'])),
+                    reason=reason,
+                    bot=telegram_bot,
+                    chat_id=telegram_chat_id
+                )
+                
+                try:
+                    client.cancel_all_open_orders(symbol)
+                except:
+                    pass
+                
+                return
+        
+        except Exception as e:
+            log(f"Monitor error: {str(e)}", telegram_bot, telegram_chat_id)
+        
+        time.sleep(1)
+
+# ------------------- TRADING LOOP -------------------
+def trading_loop(client: BinanceClient, symbol: str, telegram_bot: Optional[str], telegram_chat_id: Optional[str]):
+    global bot_state
+    filters = get_symbol_filters(client, symbol)
+    tick_size = filters['tickSize']
+    
+    # Check for existing position on startup
+    if has_active_position(client, symbol):
+        pos = fetch_open_positions_details(client, symbol)
+        if pos:
+            pos_amt = Decimal(str(pos.get("positionAmt", "0")))
+            if pos_amt != Decimal("0"):
+                with bot_state._trade_lock:
+                    bot_state.current_trade = TradeState()
+                    bot_state.current_trade.active = True
+                    bot_state.current_trade.side = "LONG" if pos_amt > 0 else "SHORT"
+                    bot_state.current_trade.qty = abs(pos_amt)
+                    bot_state.current_trade.entry_price = Decimal(str(pos.get("entryPrice", "0")))
+                    bot_state.current_trade.entry_R = bot_state.current_trade.entry_price * SL_PCT
+                    bot_state.current_trade.risk = bot_state.current_trade.entry_R
+                    
+                    # Calculate trail activation price
+                    if bot_state.current_trade.side == "LONG":
+                        bot_state.current_trade.trail_activation = bot_state.current_trade.entry_price + (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
+                    else:
+                        bot_state.current_trade.trail_activation = bot_state.current_trade.entry_price - (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
+                
+                log(f"Existing position detected on startup: {bot_state.current_trade.side} {bot_state.current_trade.qty} @ {bot_state.current_trade.entry_price}", 
+                    telegram_bot, telegram_chat_id)
+                
+                # Start monitor for existing position
+                threading.Thread(
+                    target=monitor_trade,
+                    args=(client, symbol, bot_state.current_trade, tick_size, telegram_bot, telegram_chat_id),
+                    daemon=True
+                ).start()
+    
+    while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
+        time.sleep(1)  # Just keep thread alive, monitoring is handled separately
+    
+    log("Trading loop exited.", telegram_bot, telegram_chat_id)
+# ------------------- SCHEDULER -------------------
+def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
+    global bot_state
+    last_month: Optional[int] = None
+    
+    def daily_reset_job():
+        try:
+            current_balance = fetch_balance(bot_state.client)
+            if current_balance > 0:
+                bot_state.account_size = current_balance
+                log(f"DAILY RESET @ 00:00 UTC | New start equity: ${current_balance:.2f}", bot, chat_id)
+        except Exception as e:
+            log(f"Daily reset failed: {e}", bot, chat_id)
+    
+    def weekly_reset_job():
+        bot_state.CONSEC_LOSSES = 0
+        bot_state.consec_loss_guard_alert_sent = False
+        log("WEEKLY RESET: Consecutive loss streak cleared.", bot, chat_id)
+        
+    def check_monthly_report():
+        nonlocal last_month
+        current_date = datetime.now(timezone.utc)
+        if current_date.day == 1 and (last_month is None or current_date.month != last_month):
+            send_monthly_report(bot, chat_id) 
+            last_month = current_date.month
+            
+    def monthly_cleanup_job():
+        """Monthly memory cleanup after PnL report"""
+        import gc
+        import psutil
+        
+        try:
+            # Get memory before cleanup
+            process = psutil.Process()
+            mem_before = process.memory_info().rss / 1024 / 1024
+            
+            log("🧹 Starting monthly memory cleanup...", bot, chat_id)
+            
+            # Force garbage collection
+            gc.collect()
+            
+            # Clear symbol filters cache
+            if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
+                with bot_state._trade_lock:
+                    bot_state.symbol_filters_cache.clear()
+            
+            # Get memory after cleanup
+            mem_after = process.memory_info().rss / 1024 / 1024
+            mem_freed = mem_before - mem_after
+            
+            log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
+                bot, chat_id)
+                
+        except Exception as e:
+            log(f"❌ Monthly cleanup error: {e}", bot, chat_id)
+            
+    schedule.every().day.at("00:00").do(daily_reset_job)
+    schedule.every().monday.at("00:00").do(weekly_reset_job)
+    schedule.every().day.at("00:01").do(check_monthly_report)  # Keep existing
+    schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
+    
+    while not bot_state.STOP_REQUESTED:
+        schedule.run_pending()
+        time.sleep(1)
+
+# ------------------- WEBHOOK PROCESSING -------------------
+def process_alert(data: Dict[str, Any]):
+    global bot_state, CMD_ARGS
+    
+    symbol = data.get('symbol')
+    if symbol != CMD_ARGS.symbol.upper():
+        log(f"Symbol mismatch: {symbol} != {CMD_ARGS.symbol.upper()}")
+        return
+    
+    side = data.get('side', '').upper()
+    qty_str = data.get('qty')
+    if not qty_str:
+        log("Missing quantity")
+        return
+    qty = Decimal(qty_str)
+    order_type = data.get('type', '').upper()
+    reduce_only = data.get('reduceOnly', False)
+    
+    # Extract optional SL and TP from combined payload
+    stop_price_str = data.get('stopPrice')
+    take_profit_str = data.get('takeProfit')
+    
+    client = bot_state.client
+    filters = get_symbol_filters(client, symbol)
+    step_size = filters['stepSize']
+    tick_size = filters['tickSize']
+    
+    # Quantize quantity
+    qty_quant = quantize_qty(qty, step_size)
+    
+    with bot_state._trade_lock:
+        current_trade = bot_state.current_trade
+    
+    if order_type == 'MARKET':
+        if reduce_only:  # Exit order from Pine Script's gen_exit_json()
+            if not current_trade or not current_trade.active:
+                log("No active position to close")
+                return
+            
+            pos_amt = get_position_amt(client, symbol)
+            if pos_amt == Decimal('0'):
+                log("Position already closed")
+                with bot_state._trade_lock:
+                    if bot_state.current_trade:
+                        bot_state.current_trade.active = False
+                return
+            
+            close_side = "SELL" if pos_amt > Decimal('0') else "BUY"
+            if side != close_side:
+                log(f"Close side mismatch: expected {close_side}, got {side}")
+                return
+            
+            close_qty = abs(pos_amt)
+            response = client.send_signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol,
+                "side": close_side,
+                "type": "MARKET",
+                "quantity": str(close_qty),
+                "reduceOnly": True
+            })
+            log(f"Close order sent: {response}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            
+        else:  # Entry order from gen_entry_json()
+            if current_trade and current_trade.active:
+                log("Position already active, ignoring entry", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            if NEWS_GUARD_ENABLED:
+                blocked, reason = is_news_blocked()
+                if blocked:
+                    log(f"News blocked: {reason}, ignoring entry", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    return
+            
+            response = client.send_signed_request("POST", "/fapi/v1/order", {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": str(qty_quant)
+            })
+            
+            order_id = response.get("orderId")
+            if not order_id:
+                log("Entry order failed", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                return
+            
+            log(f"Entry order placed: {response}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+            
+            # Wait for fill
+            start_time = time.time()
+            filled = False
+            while time.time() - start_time < ORDER_FILL_TIMEOUT:
+                pos_amt = get_position_amt(client, symbol)
+                if pos_amt != Decimal('0'):
+                    with bot_state._trade_lock:
+                        bot_state.current_trade = TradeState()
+                        bot_state.current_trade.active = True
+                        bot_state.current_trade.qty = abs(pos_amt)
+                        bot_state.current_trade.side = "LONG" if pos_amt > Decimal('0') else "SHORT"
+                        
+                        actual_fill = client.get_latest_fill_price(symbol, order_id)
+                        if actual_fill is None:
+                            ticker = client.public_request("/fapi/v1/ticker/price", {"symbol": symbol})
+                            actual_fill = Decimal(str(ticker["price"]))
+                        
+                        bot_state.current_trade.entry_price = actual_fill
+                        bot_state.current_trade.entry_R = actual_fill * SL_PCT
+                        bot_state.current_trade.risk = bot_state.current_trade.entry_R
+                        bot_state.current_trade.entry_close_time = int(time.time() * 1000)
+                        
+                        # Calculate trail activation price (1.25R)
+                        if bot_state.current_trade.side == "LONG":
+                            bot_state.current_trade.trail_activation = actual_fill + (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
+                        else:
+                            bot_state.current_trade.trail_activation = actual_fill - (TRAIL_TRIGGER_MULT * bot_state.current_trade.entry_R)
+                        
+                        # Quantize trail activation
+                        bot_state.current_trade.trail_activation = quantize_price(
+                            bot_state.current_trade.trail_activation, 
+                            tick_size,
+                            ROUND_UP if bot_state.current_trade.side == "LONG" else ROUND_DOWN
+                        )
+                    
+                    log(f"Entry filled: {bot_state.current_trade.side}, qty={bot_state.current_trade.qty}, price={actual_fill}",
+                        CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    
+                    filled = True
+                    break
+                time.sleep(0.5)
+            
+            if not filled:
+                log("Entry timeout, cancelling", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                try:
+                    client.cancel_order(symbol, order_id)
+                except:
+                    pass
+                return
+            
+            # Now that we have the trade state, place all protective orders immediately
+            with bot_state._trade_lock:
+                trade = bot_state.current_trade
+                if trade and trade.active:
+                    # Calculate callback rate (2R as percentage)
+                    callback_rate = TRAIL_DISTANCE_MULT * SL_PCT * Decimal('100')
+                    
+                    # 1. Place Stop Loss
+                    sl_price = None
+                    if trade.side == "LONG":
+                        sl_price = trade.entry_price * (Decimal("1") - SL_PCT)
+                        sl_price = quantize_price(sl_price, tick_size, ROUND_DOWN)
+                        sl_side = "SELL"
+                    else:
+                        sl_price = trade.entry_price * (Decimal("1") + SL_PCT)
+                        sl_price = quantize_price(sl_price, tick_size, ROUND_UP)
+                        sl_side = "BUY"
+                    
+                    sl_order = client.place_stop_market(symbol, sl_side, trade.qty, sl_price, reduce_only=True)
+                    if sl_order and sl_order.get("algoId"):
+                        trade.sl_algo_id = sl_order["algoId"]
+                        trade.sl = sl_price
+                        log(f"SL placed at {sl_price}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    
+                    # 2. Place Take Profit
+                    tp_price = None
+                    if trade.side == "LONG":
+                        tp_price = trade.entry_price + (TP_MULT * trade.entry_R)
+                        tp_price = quantize_price(tp_price, tick_size, ROUND_UP)
+                        tp_side = "SELL"
+                    else:
+                        tp_price = trade.entry_price - (TP_MULT * trade.entry_R)
+                        tp_price = quantize_price(tp_price, tick_size, ROUND_DOWN)
+                        tp_side = "BUY"
+                    
+                    tp_order = client.place_take_profit_market(symbol, tp_side, trade.qty, tp_price, reduce_only=True)
+                    if tp_order and tp_order.get("algoId"):
+                        trade.tp_algo_id = tp_order["algoId"]
+                        trade.tp = tp_price
+                        log(f"TP placed at {tp_price}", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    
+                    # 3. Place Trailing Stop (IMMEDIATELY, with activation price)
+                    trail_side = "SELL" if trade.side == "LONG" else "BUY"
+                    trail_order = client.place_trailing_stop_market(
+                        symbol=symbol,
+                        side=trail_side,
+                        quantity=trade.qty,
+                        activation_price=trade.trail_activation,
+                        callback_rate=callback_rate,
+                        reduce_only=True
+                    )
+                    
+                    if trail_order and trail_order.get("algoId"):
+                        trade.trail_algo_id = trail_order["algoId"]
+                        log(f"Trailing stop placed - Activation: {trade.trail_activation}, Callback: {callback_rate}%", 
+                            CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                        
+                        # Send Telegram notification
+                        send_trail_placed_telegram(
+                            symbol, trade.side, 
+                            trade.trail_activation, callback_rate,
+                            CMD_ARGS.telegram_token, CMD_ARGS.chat_id
+                        )
+                    
+                    # Send comprehensive entry telegram
+                    send_trade_telegram({
+                        'symbol': symbol,
+                        'side': trade.side,
+                        'entry': trade.entry_price,
+                        'qty': trade.qty,
+                        'sl': trade.sl,
+                        'tp': trade.tp,
+                        'trail_activation': trade.trail_activation,
+                        'callback_rate': callback_rate
+                    }, CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    
+                    # Start monitoring thread AFTER all orders are placed
+                    log("Starting trade monitoring after all protective orders placed", 
+                        CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    threading.Thread(
+                        target=monitor_trade,
+                        args=(client, symbol, trade, tick_size, CMD_ARGS.telegram_token, CMD_ARGS.chat_id),
+                        daemon=True
+                    ).start()
+    
+    elif order_type == 'STOP_MARKET':  # From gen_sl_json() - for initial SL placement or updates
+        stop_price_str = data.get('stopPrice')
+        if not stop_price_str:
+            log("No stopPrice in alert")
+            return
+        
+        stop_price = Decimal(stop_price_str)
+        stop_price_quant = quantize_price(stop_price, tick_size)
+        
+        with bot_state._trade_lock:
+            current_trade = bot_state.current_trade
+        
+        if not current_trade or not current_trade.active:
+            log("No active position, ignoring SL")
+            return
+        
+        expected_close_side = "SELL" if current_trade.side == "LONG" else "BUY"
+        if side != expected_close_side:
+            log(f"SL side mismatch: expected {expected_close_side}, got {side}")
+            return
+        
+        if abs(qty_quant - current_trade.qty) > Decimal('0.001'):
+            log(f"SL qty mismatch: expected {current_trade.qty}, got {qty_quant}")
+            return
+        
+        # Cancel old SL if exists
+        if current_trade.sl_algo_id:
+            try:
+                client.cancel_algo_order(symbol, current_trade.sl_algo_id)
+                log(f"Cancelled old SL: {current_trade.sl_algo_id}")
+            except:
+                pass
+        
+        # Place new SL as ALGO order
+        sl_order = client.place_stop_market(symbol, side, qty_quant, stop_price_quant, reduce_only=True)
+        if sl_order and sl_order.get("algoId"):
+            with bot_state._trade_lock:
+                if bot_state.current_trade:
+                    bot_state.current_trade.sl_algo_id = sl_order["algoId"]
+                    bot_state.current_trade.sl = stop_price_quant
+            log(f"SL placed/updated at {stop_price_quant} (algoId: {sl_order['algoId']})", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+        else:
+            log("SL placement failed", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+    
+    elif order_type == 'TAKE_PROFIT_MARKET':  # From gen_tp_json() - for initial TP placement
+        tp_price_str = data.get('takeProfit')
+        if not tp_price_str:
+            log("No takeProfit in alert")
+            return
+        
+        tp_price = Decimal(tp_price_str)
+        tp_price_quant = quantize_price(tp_price, tick_size)
+        
+        with bot_state._trade_lock:
+            current_trade = bot_state.current_trade
+        
+        if not current_trade or not current_trade.active:
+            log("No active position, ignoring TP")
+            return
+        
+        expected_close_side = "SELL" if current_trade.side == "LONG" else "BUY"
+        if side != expected_close_side:
+            log(f"TP side mismatch: expected {expected_close_side}, got {side}")
+            return
+        
+        if abs(qty_quant - current_trade.qty) > Decimal('0.001'):
+            log(f"TP qty mismatch: expected {current_trade.qty}, got {qty_quant}")
+            return
+        
+        # Cancel old TP if exists
+        if current_trade.tp_algo_id:
+            try:
+                client.cancel_algo_order(symbol, current_trade.tp_algo_id)
+                log(f"Cancelled old TP: {current_trade.tp_algo_id}")
+            except:
+                pass
+        
+        # Place new TP as ALGO order
+        tp_order = client.place_take_profit_market(symbol, side, qty_quant, tp_price_quant, reduce_only=True)
+        if tp_order and tp_order.get("algoId"):
+            with bot_state._trade_lock:
+                if bot_state.current_trade:
+                    bot_state.current_trade.tp_algo_id = tp_order["algoId"]
+                    bot_state.current_trade.tp = tp_price_quant
+            log(f"TP placed/updated at {tp_price_quant} (algoId: {tp_order['algoId']})", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+        else:
+            log("TP placement failed", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if bot_state.STOP_REQUESTED:
+        return "Bot stopped", 503
+    
+    # === DEBUG LOGGING - CRITICAL FOR DIAGNOSIS ===
+    raw_body = request.get_data(as_text=True)
+    content_type = request.headers.get('Content-Type', 'MISSING')
+    log(f"WEBHOOK RAW - Type: {content_type} | Length: {len(raw_body)} | Preview: {raw_body[:200]}")
+    
+    # === MULTI-STRATEGY PARSING ===
+    data = None
+    
+    # Strategy 1: Try normal JSON parsing (respects content-type)
+    if request.is_json:
+        try:
+            data = request.get_json()
+            log("Parsed via is_json")
+        except:
+            pass
+    
+    # Strategy 2: Force JSON parsing (ignores content-type)
+    if not data:
+        try:
+            data = request.get_json(force=True)
+            log("Parsed via force=True")
+        except:
+            pass
+    
+    # Strategy 3: Manual JSON loading from raw body
+    if not data and raw_body:
+        try:
+            # Clean the raw body (remove BOM, trim)
+            cleaned = raw_body.strip().lstrip('\ufeff')
+            data = json.loads(cleaned)
+            log("Parsed via manual json.loads")
+        except Exception as e:
+            log(f"Manual parse failed: {e}")
+    
+    # === VALIDATION ===
+    if not data:
+        log(f"FAILED: No valid JSON - Raw: {raw_body[:300]}")
+        return "Invalid JSON payload", 400
+    
+    uid = data.get('uid')
+    if uid != my_uid:
+        log(f"Invalid UID: {uid}")
+        return "Invalid UID", 403
+    
+    # Process in background
+    threading.Thread(target=process_alert, args=(data,), daemon=True).start()
+    
+    return jsonify({"status": "ok"}), 200
+
+# ------------------- MAIN -------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Binance Futures Bot - Webhook Mode with Immediate Trailing Stop")
+    parser.add_argument("--api-key", required=True, help="Binance API Key")
+    parser.add_argument("--api-secret", required=True, help="Binance API Secret")
+    parser.add_argument("--telegram-token", required=True, help="Telegram Bot Token")
+    parser.add_argument("--chat-id", required=True, help="Telegram Chat ID")
+    parser.add_argument("--symbol", default="SOLUSDT", help="Trading symbol")
+    parser.add_argument("--live", action="store_true")
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--no-news-guard", action="store_true", help="Disable news guard")
+    parser.add_argument("--port", type=int, default=8080, help="Webhook port")
+    
+    args = parser.parse_args()
+    CMD_ARGS = args  # Store for webhook access
+    
+    if args.no_news_guard:
+        NEWS_GUARD_ENABLED = False
+        print("[CONFIG] News Guard DISABLED")
+    
+    init_pnl_log()
+    
+    # Shutdown handler
+    _shutdown_done = False
+    
+    def graceful_shutdown(sig=None, frame=None):
+        global _shutdown_done
+        if _shutdown_done:
+            return
+        _shutdown_done = True
+        
+        reason = {
+            signal.SIGINT: "Ctrl+C",
+            signal.SIGTERM: "SIGTERM",
+        }.get(sig, "Clean exit")
+        
+        goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
+        try:
+            log(goodbye, args.telegram_token, args.chat_id)
+        except:
+            pass
+        
+        try:
+            if LOCK_HANDLE:
+                LOCK_HANDLE.close()
+            if os.path.exists(LOCK_FILE):
+                os.unlink(LOCK_FILE)
+        except:
+            pass
+        
+        os._exit(0)
+    
+    signal.signal(signal.SIGINT, graceful_shutdown)
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    atexit.register(graceful_shutdown)
+    
+    # Main loop with auto-restart
+    while True:
+        if os.path.exists("/tmp/STOP_BOT_NOW"):
+            log("STOP_BOT_NOW flag detected – shutting down", args.telegram_token, args.chat_id)
+            graceful_shutdown()
+            break
+        
+        try:
+            bot_state.client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
+            balance = fetch_balance(bot_state.client)
+            bot_state.account_size = balance
+            
+            leverage_to_set = 9
+            bot_state.client.set_leverage(args.symbol, leverage_to_set)
+            log(f"Set leverage to {leverage_to_set}x", args.telegram_token, args.chat_id)
+            log(f"Balance: ${balance:.2f}", args.telegram_token, args.chat_id)
+            
+            if NEWS_GUARD_ENABLED:
+                threading.Thread(target=news_heartbeat, daemon=True).start()
+                log("News guard: ENABLED", args.telegram_token, args.chat_id)
+            
+            log(f"STARTING WEBHOOK BOT → {args.symbol} | {'LIVE' if args.live else 'TESTNET'}",
+                args.telegram_token, args.chat_id)
+            
+            threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+            
+            # Start Flask in a thread
+            flask_thread = threading.Thread(
+                target=app.run,
+                kwargs={'host': '0.0.0.0', 'port': args.port, 'debug': False, 'use_reloader': False},
+                daemon=True
+            )
+            flask_thread.start()
+            
+            log(f"Webhook listening on port {args.port}", args.telegram_token, args.chat_id)
+            
+            trading_loop(
+                client=bot_state.client,
+                symbol=args.symbol,
+                telegram_bot=args.telegram_token,
+                telegram_chat_id=args.chat_id
+            )
+            
+            log("Bot stopped cleanly", args.telegram_token, args.chat_id)
+            break
+        
+        except Exception as e:
+            error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
+            try:
+                log(error_msg, args.telegram_token, args.chat_id)
+            except:
+                print(error_msg)
+            time.sleep(15)
