@@ -25,6 +25,12 @@ import socket
 import platform
 import numpy as np
 from flask import Flask, request, jsonify
+import io
+
+# Fix Windows console encoding
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 # ------------------- WEBHOOK SETUP -------------------
 app = Flask(__name__)
 my_uid = "6e8769164ae8eedf74dcaaeb86000f8e03d166bf5181f8eb283a4bb90e6574a2"
@@ -1586,12 +1592,41 @@ if __name__ == "__main__":
             signal.SIGTERM: "SIGTERM",
         }.get(sig, "Clean exit")
         
+        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
+            args.telegram_token, args.chat_id)
+        
+        # Close any open position and cancel orders
+        if bot_state.client and args.symbol:
+            try:
+                # Check if there's an active position
+                pos_amt = get_position_amt(bot_state.client, args.symbol)
+                if pos_amt != Decimal('0'):
+                    log(f"Closing open position...", args.telegram_token, args.chat_id)
+                    side = "SELL" if pos_amt > Decimal('0') else "BUY"
+                    qty = abs(pos_amt)
+                    bot_state.client.send_signed_request("POST", "/fapi/v1/order", {
+                        "symbol": args.symbol,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": str(qty)
+                    })
+                    time.sleep(1)
+                
+                # Cancel all orders (ZOMBIE KILLER)
+                log(f"Cleaning up orders...", args.telegram_token, args.chat_id)
+                bot_state.client.cancel_all_open_orders(args.symbol)
+                
+            except Exception as e:
+                log(f"Cleanup error: {e}", args.telegram_token, args.chat_id)
+        
+        # Final goodbye
         goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
         try:
             log(goodbye, args.telegram_token, args.chat_id)
         except:
             pass
         
+        # Clean lock file
         try:
             if LOCK_HANDLE:
                 LOCK_HANDLE.close()
@@ -1600,8 +1635,8 @@ if __name__ == "__main__":
         except:
             pass
         
-        os._exit(0)
-    
+        sys.exit(0)
+
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
     atexit.register(graceful_shutdown)
