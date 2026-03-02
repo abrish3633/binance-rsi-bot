@@ -1114,6 +1114,8 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
     schedule.every().day.at("00:01").do(check_monthly_report)  # Keep existing
     schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
     
+    schedule.every().day.at("23:59").do(lambda: send_daily_report(CMD_ARGS.telegram_token, CMD_ARGS.chat_id))
+    schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(CMD_ARGS.telegram_token, CMD_ARGS.chat_id))
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
         time.sleep(1)
