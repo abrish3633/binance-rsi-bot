@@ -39,7 +39,7 @@ my_uid = "6e8769164ae8eedf74dcaaeb86000f8e03d166bf5181f8eb283a4bb90e6574a2"
 CMD_ARGS = None
 
 # ------------------- CONFIGURATION -------------------
-RISK_PCT = Decimal("0.068")
+RISK_PCT = Decimal("0.0378")
 SL_PCT = Decimal("0.0075")  # 0.75% from Pine Script
 TP_MULT = Decimal("9")
 TRAIL_TRIGGER_MULT = Decimal("1.25")  # Activate trailing after 1.25R profit
@@ -79,7 +79,7 @@ BUFFER_MINUTES = 5
 NEWS_GUARD_ENABLED = False
 MAX_ENTRY_SLIPPAGE_PCT = Decimal("0.002")
 LOCK_FILE = os.path.join(os.getenv('TEMP', '/tmp'), 'sol_rsi_bot_webhook.lock')
-BASE_RISK_PCT = Decimal("0.068")
+BASE_RISK_PCT = Decimal("0.0378")
 MAX_LEVERAGE = Decimal("9")
 ENABLE_WEEKLY_SCALING = True
 HALF_R_THRESHOLD = Decimal("0.00375")
@@ -1653,7 +1653,7 @@ if __name__ == "__main__":
             balance = fetch_balance(bot_state.client)
             bot_state.account_size = balance
             
-            leverage_to_set = 9
+            leverage_to_set = 5
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set leverage to {leverage_to_set}x", args.telegram_token, args.chat_id)
             log(f"Balance: ${balance:.2f}", args.telegram_token, args.chat_id)
