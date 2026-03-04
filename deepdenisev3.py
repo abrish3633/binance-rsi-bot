@@ -1059,8 +1059,68 @@ def trading_loop(client: BinanceClient, symbol: str, telegram_bot: Optional[str]
         time.sleep(1)  # Just keep thread alive, monitoring is handled separately
     
     log("Trading loop exited.", telegram_bot, telegram_chat_id)
+# ------------------- PNL REPORT FUNCTIONS -------------------
+def calculate_pnl_report(period: str) -> str:
+    """Calculate PnL report for daily, weekly, or monthly period"""
+    global bot_state
+    now = datetime.now(timezone.utc)
+    
+    if period == 'daily':
+        start_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'weekly':
+        start_time = now - timedelta(days=now.weekday())
+        start_time = start_time.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == 'monthly':
+        start_time = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        return "Invalid period specified."
+    
+    # Filter trades from the period
+    filtered_trades = [
+        trade for trade in bot_state.pnl_data
+        if datetime.fromisoformat(trade['date']) >= start_time
+    ]
+    
+    if not filtered_trades:
+        return f"No trades recorded for the {period} period."
+    
+    # Calculate statistics
+    total_pnl_usd = Decimal(str(sum(trade['pnl_usd'] for trade in filtered_trades)))
+    total_pnl_r = Decimal(str(sum(trade['pnl_r'] for trade in filtered_trades)))
+    num_trades = len(filtered_trades)
+    avg_pnl_usd = total_pnl_usd / Decimal(str(num_trades)) if num_trades > 0 else Decimal("0")
+    wins = sum(1 for trade in filtered_trades if trade['pnl_usd'] > 0)
+    losses = num_trades - wins
+    win_rate = (Decimal(str(wins)) / Decimal(str(num_trades)) * Decimal("100")) if num_trades > 0 else Decimal("0")
+    
+    return (
+        f"{period.capitalize()} PNL Report:\n"
+        f"• Total Trades: {num_trades}\n"
+        f"• Total PNL: ${total_pnl_usd:.2f}\n"
+        f"• Average PNL: ${avg_pnl_usd:.2f}\n"
+        f"• Total PNL (R): {total_pnl_r:.2f}R\n"
+        f"• Win Rate: {win_rate:.1f}% ({wins}W/{losses}L)\n"
+    )
+
+def send_daily_report(bot_token: Optional[str], chat_id: Optional[str]):
+    """Send daily PnL report via Telegram"""
+    report = calculate_pnl_report('daily')
+    subject = f"📊 Daily PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    telegram_post(bot_token, chat_id, f"{subject}\n{report}")
+
+def send_weekly_report(bot_token: Optional[str], chat_id: Optional[str]):
+    """Send weekly PnL report via Telegram"""
+    report = calculate_pnl_report('weekly')
+    subject = f"📈 Weekly PnL Report - Week of {datetime.now(timezone.utc).strftime('%Y-%m-%d')}"
+    telegram_post(bot_token, chat_id, f"{subject}\n{report}")
+
+def send_monthly_report(bot_token: Optional[str], chat_id: Optional[str]):
+    """Send monthly PnL report via Telegram"""
+    report = calculate_pnl_report('monthly')
+    subject = f"📉 Monthly PnL Report - {datetime.now(timezone.utc).strftime('%Y-%m')}"
+    telegram_post(bot_token, chat_id, f"{subject}\n{report}")
 # ------------------- SCHEDULER -------------------
-def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
+def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
     global bot_state
     last_month: Optional[int] = None
     
@@ -1069,20 +1129,20 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
             current_balance = fetch_balance(bot_state.client)
             if current_balance > 0:
                 bot_state.account_size = current_balance
-                log(f"DAILY RESET @ 00:00 UTC | New start equity: ${current_balance:.2f}", bot, chat_id)
+                log(f"DAILY RESET @ 00:00 UTC | New start equity: ${current_balance:.2f}", bot_token, chat_id)
         except Exception as e:
-            log(f"Daily reset failed: {e}", bot, chat_id)
+            log(f"Daily reset failed: {e}", bot_token, chat_id)
     
     def weekly_reset_job():
         bot_state.CONSEC_LOSSES = 0
         bot_state.consec_loss_guard_alert_sent = False
-        log("WEEKLY RESET: Consecutive loss streak cleared.", bot, chat_id)
+        log("WEEKLY RESET: Consecutive loss streak cleared.", bot_token, chat_id)
         
     def check_monthly_report():
         nonlocal last_month
         current_date = datetime.now(timezone.utc)
         if current_date.day == 1 and (last_month is None or current_date.month != last_month):
-            send_monthly_report(bot, chat_id) 
+            send_monthly_report(bot_token, chat_id) 
             last_month = current_date.month
             
     def monthly_cleanup_job():
@@ -1091,37 +1151,39 @@ def run_scheduler(bot: Optional[str], chat_id: Optional[str]):
         import psutil
         
         try:
-            # Get memory before cleanup
             process = psutil.Process()
             mem_before = process.memory_info().rss / 1024 / 1024
             
-            log("🧹 Starting monthly memory cleanup...", bot, chat_id)
+            log("🧹 Starting monthly memory cleanup...", bot_token, chat_id)
             
-            # Force garbage collection
             gc.collect()
             
-            # Clear symbol filters cache
             if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
-                with bot_state._trade_lock:
+                if hasattr(bot_state, '_trade_lock'):
+                    with bot_state._trade_lock:
+                        bot_state.symbol_filters_cache.clear()
+                else:
                     bot_state.symbol_filters_cache.clear()
             
-            # Get memory after cleanup
             mem_after = process.memory_info().rss / 1024 / 1024
             mem_freed = mem_before - mem_after
             
             log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
-                bot, chat_id)
+                bot_token, chat_id)
                 
         except Exception as e:
-            log(f"❌ Monthly cleanup error: {e}", bot, chat_id)
-            
+            log(f"❌ Monthly cleanup error: {e}", bot_token, chat_id)
+    
+    # Schedule all jobs
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
-    schedule.every().day.at("00:01").do(check_monthly_report)  # Keep existing
-    schedule.every().day.at("00:02").do(monthly_cleanup_job)    # Add this
+    schedule.every().day.at("00:01").do(check_monthly_report)
+    schedule.every().day.at("00:02").do(monthly_cleanup_job)
+    schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
+    schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
     
-    schedule.every().day.at("23:59").do(lambda: send_daily_report(CMD_ARGS.telegram_token, CMD_ARGS.chat_id))
-    schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(CMD_ARGS.telegram_token, CMD_ARGS.chat_id))
+    log("📅 Scheduler initialized - Daily/Weekly/Monthly reports + cleanup active", bot_token, chat_id)
+    
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
         time.sleep(1)
