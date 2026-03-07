@@ -1145,8 +1145,8 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             send_monthly_report(bot_token, chat_id) 
             last_month = current_date.month
             
-    def monthly_cleanup_job():
-        """Monthly memory cleanup after PnL report"""
+    def daily_aggressive_cleanup_job():
+        """Aggressive daily memory cleanup - runs every day at 01:00 UTC"""
         import gc
         import psutil
         
@@ -1154,35 +1154,93 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             process = psutil.Process()
             mem_before = process.memory_info().rss / 1024 / 1024
             
-            log("🧹 Starting monthly memory cleanup...", bot_token, chat_id)
+            log("🧹 Starting DAILY aggressive memory cleanup...", bot_token, chat_id)
             
+            # 1. Force multiple garbage collection cycles
             gc.collect()
+            gc.collect(2)  # Full collection
             
-            if hasattr(bot_state, 'symbol_filters_cache') and len(bot_state.symbol_filters_cache) > 10:
+            # 2. Clear ALL caches
+            if hasattr(bot_state, 'symbol_filters_cache'):
                 if hasattr(bot_state, '_trade_lock'):
                     with bot_state._trade_lock:
                         bot_state.symbol_filters_cache.clear()
                 else:
                     bot_state.symbol_filters_cache.clear()
             
+            # 3. Clear any stored data (keep only last 1000 trades)
+            if hasattr(bot_state, 'pnl_data') and len(bot_state.pnl_data) > 1000:
+                bot_state.pnl_data = bot_state.pnl_data[-1000:]
+            
+            # 4. Clear news cache
+            if hasattr(bot_state, '_news_cache'):
+                bot_state._news_cache.clear()
+            
+            # 5. Clear WebSocket-related objects
+            if hasattr(bot_state, '_price_queue'):
+                queue_size = 0
+                try:
+                    queue_size = bot_state._price_queue.qsize()
+                except:
+                    pass
+                
+                if queue_size > 0:
+                    log(f"Clearing {queue_size} stuck WebSocket messages", bot_token, chat_id)
+                
+                while not bot_state._price_queue.empty():
+                    try:
+                        bot_state._price_queue.get_nowait()
+                    except:
+                        pass
+            
+            # 6. Aggressive memory release
+            import ctypes
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except:
+                pass
+            
+            # 7. Force Python to release memory
+            for i in range(3):
+                gc.collect()
+            
             mem_after = process.memory_info().rss / 1024 / 1024
             mem_freed = mem_before - mem_after
             
-            log(f"✅ Monthly cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
+            log(f"✅ Daily aggressive cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
                 bot_token, chat_id)
-                
+            
+            # Alert if memory is still too high
+            if mem_after > 1000:
+                log(f"⚠️ WARNING: Memory still high at {mem_after:.1f}MB - Consider restart", 
+                    bot_token, chat_id)
+                    
         except Exception as e:
-            log(f"❌ Monthly cleanup error: {e}", bot_token, chat_id)
+            log(f"❌ Daily cleanup error: {e}", bot_token, chat_id)
+
+    def weekly_restart_warning():
+        """Warn if memory is too high and recommend restart"""
+        import psutil
+        process = psutil.Process()
+        mem_current = process.memory_info().rss / 1024 / 1024
+        
+        if mem_current > 1500:  # 1.5GB
+            log(f"🚨 CRITICAL: Memory at {mem_current:.1f}MB - Manual restart recommended!", 
+                bot_token, chat_id)
+            telegram_post(bot_token, chat_id, 
+                         f"🚨 MEMORY CRITICAL: {mem_current:.1f}MB\nPlease restart the bot!")
     
     # Schedule all jobs
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:01").do(check_monthly_report)
-    schedule.every().day.at("00:02").do(monthly_cleanup_job)
+    schedule.every().day.at("01:00").do(daily_aggressive_cleanup_job)  # Daily at 1 AM
+    schedule.every().sunday.at("02:00").do(weekly_restart_warning)      # Sunday at 2 AM
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
     
-    log("📅 Scheduler initialized - Daily/Weekly/Monthly reports + cleanup active", bot_token, chat_id)
+    log("📅 Scheduler initialized - Daily reports + aggressive daily cleanup active", bot_token, chat_id)
     
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
