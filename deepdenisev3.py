@@ -129,6 +129,10 @@ class BotState:
         self.consec_loss_guard_alert_sent = False
         self.account_size: Optional[Decimal] = None
 
+        # ADD THESE MISSING ATTRIBUTES:
+        self.daily_start_equity: Optional[Decimal] = None
+        self._last_symbol_setup: Optional[str] = None  # For dynamic selection
+
 bot_state = BotState()
 
 # ------------------- TRADE STATE WITH DECIMAL -------------------
@@ -1131,13 +1135,13 @@ def save_bot_state():
     try:
         # Create a dictionary with only what we need to persist
         persistent_data = {
-            'pnl_data': bot_state.pnl_data[-1000:],  # Keep last 1000 trades
-            'last_trade_date': bot_state.last_trade_date,
-            'CONSEC_LOSSES': bot_state.CONSEC_LOSSES,
-            'weekly_peak_equity': bot_state.weekly_peak_equity,
-            'weekly_start_time': bot_state.weekly_start_time,
-            'account_size': bot_state.account_size,
-            'daily_start_equity': bot_state.daily_start_equity
+            'pnl_data': bot_state.pnl_data[-1000:] if hasattr(bot_state, 'pnl_data') else [],
+            'last_trade_date': getattr(bot_state, 'last_trade_date', None),
+            'CONSEC_LOSSES': getattr(bot_state, 'CONSEC_LOSSES', 0),
+            'weekly_peak_equity': getattr(bot_state, 'weekly_peak_equity', None),
+            'weekly_start_time': getattr(bot_state, 'weekly_start_time', None),
+            'account_size': getattr(bot_state, 'account_size', None),
+            'daily_start_equity': getattr(bot_state, 'daily_start_equity', None)
         }
         
         with open(STATE_FILE, 'wb') as f:
@@ -1456,7 +1460,7 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:01").do(check_monthly_report)
-    schedule.every().day.at("01:00").do(daily_aggressive_cleanup_job)  # Daily at 1 AM
+    schedule.every().day.at("00:00").do(daily_aggressive_cleanup_job)  # Daily at 1 AM
     schedule.every().sunday.at("02:00").do(weekly_restart_warning)      # Legacy warning
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
@@ -1900,7 +1904,7 @@ def webhook():
     threading.Thread(target=process_alert, args=(data,), daemon=True).start()
     
     return jsonify({"status": "ok"}), 200
-    
+
 def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram_chat_id):
     """Recover and monitor any existing open positions on startup"""
     global bot_state
