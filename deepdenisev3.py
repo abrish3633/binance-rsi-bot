@@ -1900,7 +1900,62 @@ def webhook():
     threading.Thread(target=process_alert, args=(data,), daemon=True).start()
     
     return jsonify({"status": "ok"}), 200
-
+    
+def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram_chat_id):
+    """Recover and monitor any existing open positions on startup"""
+    global bot_state
+    try:
+        pos_amt = get_position_amt(client, symbol)
+        if pos_amt != Decimal('0'):
+            log(f"📊 Found existing position: {abs(pos_amt)} SOL", telegram_bot, telegram_chat_id)
+            
+            # Get position details
+            pos = fetch_open_positions_details(client, symbol)
+            if pos:
+                entry_price = Decimal(str(pos.get('entryPrice', '0')))
+                log(f"   Entry price: {entry_price}", telegram_bot, telegram_chat_id)
+                
+                # Create trade state for existing position
+                trade_state = TradeState()
+                trade_state.active = True
+                trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
+                trade_state.qty = abs(pos_amt)
+                trade_state.entry_price = entry_price
+                trade_state.entry_R = entry_price * SL_PCT
+                trade_state.risk = trade_state.entry_R
+                
+                # Calculate trail activation
+                if trade_state.side == "LONG":
+                    trade_state.trail_activation = entry_price + (TRAIL_TRIGGER_MULT * trade_state.entry_R)
+                else:
+                    trade_state.trail_activation = entry_price - (TRAIL_TRIGGER_MULT * trade_state.entry_R)
+                
+                trade_state.trail_activation = quantize_price(
+                    trade_state.trail_activation,
+                    tick_size,
+                    ROUND_UP if trade_state.side == "LONG" else ROUND_DOWN
+                )
+                
+                # Store in bot_state
+                with bot_state._trade_lock:
+                    bot_state.current_trade = trade_state
+                
+                # Recover any missing orders
+                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, 
+                                                telegram_bot, telegram_chat_id)
+                
+                # Start monitoring thread
+                threading.Thread(
+                    target=monitor_trade,
+                    args=(client, symbol, trade_state, tick_size, 
+                          telegram_bot, telegram_chat_id),
+                    daemon=True
+                ).start()
+                
+                log("✅ Position recovery complete - monitoring resumed", 
+                    telegram_bot, telegram_chat_id)
+    except Exception as e:
+        log(f"❌ Position recovery error: {e}", telegram_bot, telegram_chat_id)
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures Bot - Webhook Mode with Immediate Trailing Stop")
