@@ -133,6 +133,8 @@ class BotState:
         self.daily_start_equity: Optional[Decimal] = None
         self._last_symbol_setup: Optional[str] = None  # For dynamic selection
 
+        self._active_websockets: Dict[str, Any] = {}  # ADD THIS
+
 bot_state = BotState()
 
 # ------------------- TRADE STATE WITH DECIMAL -------------------
@@ -885,6 +887,19 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
     log("Monitoring active trade...", telegram_bot, telegram_chat_id)
     last_recovery_check = Decimal("0")
     
+    # CRITICAL FIX: Close any existing WebSocket for this symbol
+    if hasattr(bot_state, '_active_websockets'):
+        if symbol in bot_state._active_websockets:
+            try:
+                old_ws = bot_state._active_websockets[symbol]
+                old_ws.close()
+                log(f"Closed existing WebSocket for {symbol}", telegram_bot, telegram_chat_id)
+            except:
+                pass
+    else:
+        bot_state._active_websockets = {}
+    
+    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
     # WebSocket setup for price feed
     ws = None
     ws_running = False
@@ -921,6 +936,7 @@ def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, t
         nonlocal ws, ws_running
         if ws_running:
             return
+        bot_state._active_websockets[symbol] = ws
         base_url = "wss://fstream.binance.com/ws" if client.use_live else "wss://stream.binancefuture.com/ws"
         ws = websocket.WebSocketApp(
             base_url,
@@ -1426,34 +1442,32 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
         log(f"📊 Weekly memory check: {mem_current:.1f}MB", bot_token, chat_id)
 
     def graceful_restart(bot_token, chat_id):
-        """Gracefully restart the bot - WITHOUT closing existing trades!"""
+        """Gracefully restart the bot - preserves ALL orders on Binance"""
         global bot_state
         
-        log("🔄 Initiating graceful restart - preserving open positions...", bot_token, chat_id)
-        telegram_post(bot_token, chat_id, "🔄 Bot restarting - open positions will remain!")
+        log("🚀 PHASE 1: Initiating graceful restart...", bot_token, chat_id)
+        log("🔄 Preserving ALL orders on Binance (SL/TP/Trailing will remain active)", bot_token, chat_id)
+        telegram_post(bot_token, chat_id, "🔄 Bot restarting in 10s - orders remain active on Binance")
         
         # SAVE STATE BEFORE RESTART!
         save_bot_state()
+        log("💾 State saved - trade history preserved", bot_token, chat_id)
         
-        # CANCEL all open ORDERS (but NOT positions!)
-        try:
-            if bot_state.client and hasattr(bot_state.client, 'cancel_all_open_orders'):
-                log("Cancelling open orders (preserving positions)...", bot_token, chat_id)
-                bot_state.client.cancel_all_open_orders(args.symbol)
-                log("✅ Open orders cancelled", bot_token, chat_id)
-        except Exception as e:
-            log(f"⚠️ Order cancellation error: {e}", bot_token, chat_id)
+        # IMPORTANT: DO NOT cancel any orders - let Binance handle them
+        log("✅ Orders remain active on Binance - SL/TP/Trailing untouched", bot_token, chat_id)
         
-        # Force final cleanup
-        for i in range(3):
-            gc.collect()
+        # Log the exit
+        log("🔄 PHASE 2: Exiting process - Binance will keep orders active", bot_token, chat_id)
+        log("⏰ Bot will restart automatically in a few seconds...", bot_token, chat_id)
         
         # Update last restart time
         nonlocal last_restart_time
         last_restart_time = time.time()
         
-        log("🔄 State saved - exiting for restart (positions remain open)...", bot_token, chat_id)
+        # Small delay to ensure logs are sent
         time.sleep(2)
+        
+        # Exit (the main loop will restart)
         os._exit(0)
     
     # Schedule all jobs
@@ -1906,49 +1920,31 @@ def webhook():
     return jsonify({"status": "ok"}), 200
 
 def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram_chat_id):
-    """Recover and monitor any existing open positions on startup"""
+    """Recover and monitor existing position - orders already on Binance"""
     global bot_state
     try:
         pos_amt = get_position_amt(client, symbol)
         if pos_amt != Decimal('0'):
-            log(f"📊 Found existing position: {abs(pos_amt)} SOL", telegram_bot, telegram_chat_id)
+            log(f"📊 Found existing position: {abs(pos_amt)} SOL (orders active on Binance)", 
+                telegram_bot, telegram_chat_id)
             
             # Get position details
             pos = fetch_open_positions_details(client, symbol)
             if pos:
                 entry_price = Decimal(str(pos.get('entryPrice', '0')))
-                log(f"   Entry price: {entry_price}", telegram_bot, telegram_chat_id)
                 
-                # Create trade state for existing position
+                # Create trade state for monitoring only
                 trade_state = TradeState()
                 trade_state.active = True
                 trade_state.side = "LONG" if pos_amt > 0 else "SHORT"
                 trade_state.qty = abs(pos_amt)
                 trade_state.entry_price = entry_price
-                trade_state.entry_R = entry_price * SL_PCT
-                trade_state.risk = trade_state.entry_R
-                
-                # Calculate trail activation
-                if trade_state.side == "LONG":
-                    trade_state.trail_activation = entry_price + (TRAIL_TRIGGER_MULT * trade_state.entry_R)
-                else:
-                    trade_state.trail_activation = entry_price - (TRAIL_TRIGGER_MULT * trade_state.entry_R)
-                
-                trade_state.trail_activation = quantize_price(
-                    trade_state.trail_activation,
-                    tick_size,
-                    ROUND_UP if trade_state.side == "LONG" else ROUND_DOWN
-                )
                 
                 # Store in bot_state
                 with bot_state._trade_lock:
                     bot_state.current_trade = trade_state
                 
-                # Recover any missing orders
-                debug_and_recover_expired_orders(client, symbol, trade_state, tick_size, 
-                                                telegram_bot, telegram_chat_id)
-                
-                # Start monitoring thread
+                # Start monitoring (orders already on Binance!)
                 threading.Thread(
                     target=monitor_trade,
                     args=(client, symbol, trade_state, tick_size, 
@@ -1956,7 +1952,7 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
                     daemon=True
                 ).start()
                 
-                log("✅ Position recovery complete - monitoring resumed", 
+                log("✅ Position recovery complete - monitoring resumed (orders untouched)", 
                     telegram_bot, telegram_chat_id)
     except Exception as e:
         log(f"❌ Position recovery error: {e}", telegram_bot, telegram_chat_id)
@@ -2082,7 +2078,7 @@ if __name__ == "__main__":
             # Check for and recover any existing positions (ADD THIS)
             recover_existing_positions(bot_state.client, args.symbol, tick_size, 
                                       args.telegram_token, args.chat_id)
-            
+            log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)  # ADD THIS
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
             # Start Flask in a thread
