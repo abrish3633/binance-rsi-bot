@@ -1193,9 +1193,6 @@ def load_bot_state():
 def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
     global bot_state
     last_month: Optional[int] = None
-    restart_attempts = 0
-    MAX_RESTART_ATTEMPTS = 3
-    last_restart_time = 0
     
     def daily_reset_job():
         try:
@@ -1218,273 +1215,33 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             send_monthly_report(bot_token, chat_id) 
             last_month = current_date.month
 
-    def check_memory_leak():
-        """Check for memory leaks - run every 6 hours"""
-        import psutil
-        import gc
-        import sys
+    def daily_restart_job():
+        """Clean daily restart at 00:02 UTC"""
+        log("🔄 DAILY RESTART: Starting scheduled restart...", bot_token, chat_id)
+        telegram_post(bot_token, chat_id, "🔄 Daily scheduled restart - bot will restart in 10 seconds")
         
-        try:
-            process = psutil.Process()
-            mem_current = process.memory_info().rss / 1024 / 1024
-            
-            log(f"📊 MEMORY CHECK: Current usage {mem_current:.1f}MB", bot_token, chat_id)
-            
-            # Force garbage collection before counting
-            gc.collect()
-            
-            # Count objects by type
-            obj_counts = {}
-            for obj in gc.get_objects():
-                obj_type = type(obj).__name__
-                obj_counts[obj_type] = obj_counts.get(obj_type, 0) + 1
-            
-            # Log top 15 object types
-            top_objects = sorted(obj_counts.items(), key=lambda x: x[1], reverse=True)[:15]
-            log(f"📊 Top object types: {top_objects}", bot_token, chat_id)
-            
-            # Check for specific problematic patterns
-            suspicious = []
-            if 'WebSocketApp' in obj_counts and obj_counts['WebSocketApp'] > 2:
-                suspicious.append(f"WebSocketApp: {obj_counts['WebSocketApp']}")
-            if 'Queue' in obj_counts and obj_counts['Queue'] > 5:
-                suspicious.append(f"Queue: {obj_counts['Queue']}")
-            if 'Thread' in obj_counts and obj_counts['Thread'] > 20:
-                suspicious.append(f"Thread: {obj_counts['Thread']}")
-            
-            if suspicious:
-                log(f"⚠️ SUSPICIOUS OBJECTS: {', '.join(suspicious)}", bot_token, chat_id)
-            
-            # Alert if memory is too high
-            if mem_current > 1000:
-                log(f"⚠️ HIGH MEMORY WARNING: {mem_current:.1f}MB", bot_token, chat_id)
-                telegram_post(bot_token, chat_id, f"⚠️ High memory warning: {mem_current:.1f}MB")
-            
-            return mem_current
-            
-        except Exception as e:
-            log(f"❌ Memory check error: {e}", bot_token, chat_id)
-            return 0
-            
-    def daily_aggressive_cleanup_job():
-        """Aggressive daily memory cleanup - runs every day at 01:00 UTC"""
-        import gc
-        import psutil
-        import sys
-        import ctypes
-        
-        try:
-            process = psutil.Process()
-            mem_before = process.memory_info().rss / 1024 / 1024
-            
-            log("🧹 Starting DAILY aggressive memory cleanup...", bot_token, chat_id)
-            
-            # BEFORE CLEANUP: Check what's using memory
-            check_memory_leak()
-            
-            # 1. Clear ALL possible caches in bot_state
-            cache_count = 0
-            for attr_name in dir(bot_state):
-                if any(x in attr_name.lower() for x in ['cache', 'queue', 'buffer', 'list', 'data']):
-                    attr = getattr(bot_state, attr_name)
-                    if hasattr(attr, 'clear'):
-                        try:
-                            size_before = len(attr) if hasattr(attr, '__len__') else '?'
-                            attr.clear()
-                            cache_count += 1
-                            log(f"  Cleared {attr_name} (size: {size_before})", bot_token, chat_id)
-                        except:
-                            pass
-                    elif isinstance(attr, dict) or isinstance(attr, list):
-                        try:
-                            size_before = len(attr)
-                            if isinstance(attr, dict):
-                                attr.clear()
-                            elif isinstance(attr, list):
-                                attr[:] = []
-                            cache_count += 1
-                            log(f"  Cleared {attr_name} (size: {size_before})", bot_token, chat_id)
-                        except:
-                            pass
-            
-            log(f"Cleared {cache_count} cache objects", bot_token, chat_id)
-            
-            # 2. Clear WebSocket queue with force
-            if hasattr(bot_state, '_price_queue'):
-                queue_size = 0
-                try:
-                    queue_size = bot_state._price_queue.qsize()
-                except:
-                    pass
-                
-                if queue_size > 0:
-                    log(f"Clearing {queue_size} stuck WebSocket messages", bot_token, chat_id)
-                
-                # Drain the queue completely
-                drained = 0
-                while True:
-                    try:
-                        bot_state._price_queue.get_nowait()
-                        drained += 1
-                    except:
-                        break
-                if drained > 0:
-                    log(f"Drained {drained} items from queue", bot_token, chat_id)
-            
-            # 3. Clear any stored data structures
-            if hasattr(bot_state, 'pnl_data') and len(bot_state.pnl_data) > 500:
-                old_size = len(bot_state.pnl_data)
-                bot_state.pnl_data = bot_state.pnl_data[-500:]  # Keep last 500 only
-                log(f"Trimmed pnl_data from {old_size} to 500", bot_token, chat_id)
-            
-            # 4. Clear symbol filters cache
-            if hasattr(bot_state, 'symbol_filters_cache'):
-                if hasattr(bot_state, '_trade_lock'):
-                    with bot_state._trade_lock:
-                        old_size = len(bot_state.symbol_filters_cache)
-                        bot_state.symbol_filters_cache.clear()
-                        log(f"Cleared symbol_filters_cache (size: {old_size})", bot_token, chat_id)
-                else:
-                    old_size = len(bot_state.symbol_filters_cache)
-                    bot_state.symbol_filters_cache.clear()
-                    log(f"Cleared symbol_filters_cache (size: {old_size})", bot_token, chat_id)
-            
-            # 5. Clear news cache
-            if hasattr(bot_state, '_news_cache'):
-                old_size = len(bot_state._news_cache)
-                bot_state._news_cache.clear()
-                log(f"Cleared _news_cache (size: {old_size})", bot_token, chat_id)
-            
-            # 6. Clear any thread-local storage
-            import threading
-            thread_count = threading.active_count()
-            if thread_count > 50:
-                log(f"High thread count: {thread_count}", bot_token, chat_id)
-            
-            # 7. FORCE garbage collection multiple times
-            total_collected = 0
-            for i in range(5):
-                collected = gc.collect()
-                total_collected += collected
-                log(f"GC cycle {i+1}: collected {collected} objects", bot_token, chat_id)
-            
-            gc.collect(2)  # Full collection
-            log(f"Total objects collected: {total_collected}", bot_token, chat_id)
-            
-            # 8. Aggressive memory release
-            try:
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
-                log("malloc_trim executed - memory returned to OS", bot_token, chat_id)
-            except:
-                pass
-            
-            # 9. AFTER CLEANUP: Check memory again
-            mem_after = process.memory_info().rss / 1024 / 1024
-            mem_freed = mem_before - mem_after
-            
-            log(f"✅ Daily aggressive cleanup complete - Memory: {mem_before:.1f}MB → {mem_after:.1f}MB (freed {mem_freed:.1f}MB)", 
-                bot_token, chat_id)
-            
-            # 10. Final object count check
-            gc.collect()
-            obj_counts = {}
-            for obj in gc.get_objects():
-                obj_type = type(obj).__name__
-                obj_counts[obj_type] = obj_counts.get(obj_type, 0) + 1
-            
-            top_after = sorted(obj_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            log(f"📊 After cleanup top objects: {top_after}", bot_token, chat_id)
-            
-            # 11. Check if we need to restart
-            nonlocal restart_attempts, last_restart_time
-            current_time = time.time()
-            
-            # Don't restart more than once every 6 hours
-            if current_time - last_restart_time < 21600:  # 6 hours
-                return
-                
-            if mem_after > 1500:  # 1.5GB - Critical, restart immediately
-                log(f"🚨 CRITICAL: Memory at {mem_after:.1f}MB - Auto-restarting in 10 seconds...", 
-                    bot_token, chat_id)
-                telegram_post(bot_token, chat_id, 
-                             f"🚨 MEMORY CRITICAL: {mem_after:.1f}MB\nAuto-restarting in 10s...")
-                time.sleep(10)
-                threading.Thread(target=graceful_restart, args=(bot_token, chat_id)).start()
-                
-            elif mem_after > 1000:  # 1GB - High, cleanup didn't help enough
-                log(f"⚠️ WARNING: Memory still high at {mem_after:.1f}MB after cleanup", 
-                    bot_token, chat_id)
-                
-                restart_attempts += 1
-                if restart_attempts >= MAX_RESTART_ATTEMPTS:
-                    log(f"🔄 Multiple high memory warnings ({restart_attempts}) - Auto-restarting...", 
-                        bot_token, chat_id)
-                    telegram_post(bot_token, chat_id, 
-                                 f"🔄 Multiple high memory warnings ({restart_attempts})\nAuto-restarting...")
-                    threading.Thread(target=graceful_restart, args=(bot_token, chat_id)).start()
-            else:
-                # Reset restart attempts on good memory
-                if restart_attempts > 0:
-                    log(f"✅ Memory good ({mem_after:.1f}MB) - resetting restart attempts", bot_token, chat_id)
-                    restart_attempts = 0
-                    
-        except Exception as e:
-            log(f"❌ Daily cleanup error: {e}", bot_token, chat_id)
-            import traceback
-            log(traceback.format_exc(), bot_token, chat_id)
-
-    def weekly_restart_warning():
-        """Legacy warning function - now just logs"""
-        import psutil
-        process = psutil.Process()
-        mem_current = process.memory_info().rss / 1024 / 1024
-        log(f"📊 Weekly memory check: {mem_current:.1f}MB", bot_token, chat_id)
-
-    def graceful_restart(bot_token, chat_id):
-        """Gracefully restart the bot - preserves ALL orders on Binance"""
-        global bot_state
-        
-        log("🚀 PHASE 1: Initiating graceful restart...", bot_token, chat_id)
-        log("🔄 Preserving ALL orders on Binance (SL/TP/Trailing will remain active)", bot_token, chat_id)
-        telegram_post(bot_token, chat_id, "🔄 Bot restarting in 10s - orders remain active on Binance")
-        
-        # SAVE STATE BEFORE RESTART!
+        # Save state before restart
         save_bot_state()
-        log("💾 State saved - trade history preserved", bot_token, chat_id)
+        log("💾 State saved - trades preserved", bot_token, chat_id)
         
-        # IMPORTANT: DO NOT cancel any orders - let Binance handle them
+        # Log that orders remain active
         log("✅ Orders remain active on Binance - SL/TP/Trailing untouched", bot_token, chat_id)
         
-        # Log the exit
-        log("🔄 PHASE 2: Exiting process - Binance will keep orders active", bot_token, chat_id)
-        log("⏰ Bot will restart automatically in a few seconds...", bot_token, chat_id)
+        # Wait a moment for logs to send
+        time.sleep(10)
         
-        # Update last restart time
-        nonlocal last_restart_time
-        last_restart_time = time.time()
-        
-        # Small delay to ensure logs are sent
-        time.sleep(2)
-        
-        # Exit (the main loop will restart)
+        # Exit - main loop will restart
         os._exit(0)
     
     # Schedule all jobs
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:01").do(check_monthly_report)
-    schedule.every().day.at("00:00").do(daily_aggressive_cleanup_job)  # Daily at 1 AM
-    schedule.every().sunday.at("02:00").do(weekly_restart_warning)      # Legacy warning
+    schedule.every().day.at("00:02").do(daily_restart_job)  # Clean restart every day!
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
-    schedule.every(6).hours.do(check_memory_leak)  # Check every 6 hours
     
-    log("📅 Scheduler initialized - Daily reports + aggressive daily cleanup + auto-restart + memory monitoring active", bot_token, chat_id)
-    
-    # Initial memory check on startup
-    time.sleep(5)  # Wait for bot to initialize
-    threading.Thread(target=check_memory_leak, daemon=True).start()
+    log("📅 Scheduler initialized - Daily restart at 00:02 UTC", bot_token, chat_id)
     
     while not bot_state.STOP_REQUESTED:
         schedule.run_pending()
