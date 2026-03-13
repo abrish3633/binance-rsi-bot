@@ -1079,7 +1079,17 @@ def trading_loop(client: BinanceClient, symbol: str, telegram_bot: Optional[str]
                     daemon=True
                 ).start()
     
+    log("Entering trading_loop - monitoring active", telegram_bot, telegram_chat_id)
+    
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
+        # ===== CRITICAL FIX: Check restart flag every iteration =====
+        with bot_state._restart_lock:
+            if bot_state.RESTART_REQUESTED:
+                log("🔄 Restart requested inside trading_loop - exiting loop cleanly",
+                    telegram_bot, telegram_chat_id)
+                bot_state.RESTART_REQUESTED = False
+                return  # Exit function → main loop restarts
+        
         time.sleep(1)  # Just keep thread alive, monitoring is handled separately
     
     log("Trading loop exited.", telegram_bot, telegram_chat_id)
@@ -1879,6 +1889,9 @@ if __name__ == "__main__":
             
             log(f"Webhook listening on port {args.port}", args.telegram_token, args.chat_id)
             
+            log("Entering trading_loop() - will check restart flag every second", 
+                args.telegram_token, args.chat_id)
+            
             trading_loop(
                 client=bot_state.client,
                 symbol=args.symbol,
@@ -1886,7 +1899,19 @@ if __name__ == "__main__":
                 telegram_chat_id=args.chat_id
             )
             
-            log("Bot stopped cleanly", args.telegram_token, args.chat_id)
+            # This log proves trading_loop exited (rare, but useful for debug)
+            log("trading_loop() has returned - checking for restart flag",
+                args.telegram_token, args.chat_id)
+            
+            # Check restart flag after trading_loop exits (redundant but safe)
+            with bot_state._restart_lock:
+                if bot_state.RESTART_REQUESTED:
+                    log("Restart flag detected after trading_loop - restarting",
+                        args.telegram_token, args.chat_id)
+                    bot_state.RESTART_REQUESTED = False
+                    continue
+            
+            log("Bot stopped cleanly (no restart flag)", args.telegram_token, args.chat_id)
             break
         
         except Exception as e:
