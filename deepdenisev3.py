@@ -135,6 +135,10 @@ class BotState:
 
         self._active_websockets: Dict[str, Any] = {}  # ADD THIS
 
+        # ADD THESE TWO LINES:
+        self.RESTART_REQUESTED = False
+        self._restart_lock = threading.Lock()
+
 bot_state = BotState()
 
 # ------------------- TRADE STATE WITH DECIMAL -------------------
@@ -1216,28 +1220,36 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             last_month = current_date.month
 
     def daily_restart_job():
-        """Clean daily restart at 00:02 UTC"""
+        """Clean daily restart at 00:02 UTC using restart flag"""
+        global bot_state
+        
+        # Use lock to prevent multiple restart requests
+        with bot_state._restart_lock:
+            if bot_state.RESTART_REQUESTED:
+                return  # Already requested, skip
+            bot_state.RESTART_REQUESTED = True
+        
         log("🔄 DAILY RESTART: Starting scheduled restart...", bot_token, chat_id)
-        telegram_post(bot_token, chat_id, "🔄 Daily scheduled restart - bot will restart in 10 seconds")
+        telegram_post(bot_token, chat_id, "🔄 Daily restart in 10 seconds - orders remain active")
         
         # Save state before restart
         save_bot_state()
         log("💾 State saved - trades preserved", bot_token, chat_id)
         
         # Log that orders remain active
-        log("✅ Orders remain active on Binance - SL/TP/Trailing untouched", bot_token, chat_id)
+        log("✅ Orders remain active on Binance - SL/TP untouched", bot_token, chat_id)
         
-        # Wait a moment for logs to send
+        # Wait for logs to send
         time.sleep(10)
         
-        # Exit - main loop will restart
-        os._exit(0)
+        log("Restart flag set - main loop will restart shortly", bot_token, chat_id)
+        # DO NOT exit - just set flag and let main loop handle it
     
     # Schedule all jobs
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:01").do(check_monthly_report)
-    schedule.every().day.at("00:02").do(daily_restart_job)  # Clean restart every day!
+    schedule.every().day.at("00:02").do(daily_restart_job)  # Daily restart at 00:02
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
     
@@ -1735,7 +1747,7 @@ if __name__ == "__main__":
     
     init_pnl_log()
     
-    # Load saved state if exists (ADD THIS BEFORE SHUTDOWN HANDLER)
+    # Load saved state if exists
     load_bot_state()
     
     # Shutdown handler
@@ -1755,7 +1767,7 @@ if __name__ == "__main__":
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
             args.telegram_token, args.chat_id)
         
-        # Save state before shutdown (ADD THIS)
+        # Save state before shutdown
         save_bot_state()
         
         # Close any open position and cancel orders
@@ -1806,10 +1818,27 @@ if __name__ == "__main__":
     
     # Main loop with auto-restart
     while True:
+        # Check for manual stop flag
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             log("STOP_BOT_NOW flag detected – shutting down", args.telegram_token, args.chat_id)
             graceful_shutdown()
             break
+        
+        # Check if restart was requested by scheduler
+        if hasattr(bot_state, 'RESTART_REQUESTED') and hasattr(bot_state, '_restart_lock'):
+            with bot_state._restart_lock:
+                if bot_state.RESTART_REQUESTED:
+                    log("🔄 Restart flag detected - performing clean restart", 
+                        args.telegram_token, args.chat_id)
+                    bot_state.RESTART_REQUESTED = False  # Reset flag
+                    
+                    # Save state before restart
+                    save_bot_state()
+                    log("💾 State saved - restarting...", args.telegram_token, args.chat_id)
+                    
+                    # Small delay before restart
+                    time.sleep(2)
+                    continue  # This restarts the entire try block
         
         try:
             bot_state.client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
@@ -1828,14 +1857,16 @@ if __name__ == "__main__":
             log(f"STARTING WEBHOOK BOT → {args.symbol} | {'LIVE' if args.live else 'TESTNET'}",
                 args.telegram_token, args.chat_id)
             
-            # Get tick_size for position recovery (ADD THIS)
+            # Get tick_size for position recovery
             filters = get_symbol_filters(bot_state.client, args.symbol)
             tick_size = filters['tickSize']
             
-            # Check for and recover any existing positions (ADD THIS)
+            # Check for and recover any existing positions
             recover_existing_positions(bot_state.client, args.symbol, tick_size, 
                                       args.telegram_token, args.chat_id)
-            log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)  # ADD THIS
+            log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)
+            
+            # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
             # Start Flask in a thread
