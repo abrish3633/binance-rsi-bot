@@ -2038,12 +2038,26 @@ if __name__ == "__main__":
             
             # ===== TELEGRAM LISTENER =====
             if CMD_ARGS.telegram_token and CMD_ARGS.chat_id:
+                # Clean up any old webhook/polling sessions first (prevents 409 Conflict)
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{CMD_ARGS.telegram_token}/deleteWebhook",
+                        timeout=5
+                    )
+                    log("Cleaned up any old Telegram webhook/polling sessions",
+                        CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                except Exception as e:
+                    log(f"Cleanup old Telegram sessions failed (usually harmless): {e}",
+                        CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                
+                # Start the listener
                 threading.Thread(
                     target=start_telegram_listener,
                     daemon=True,
                     name="TelegramListener"
                 ).start()
-                log("📱 Telegram command listener activated (/restart, /status, /balance, /help)", 
+                
+                log("📱 Telegram command listener activated (/restart, /status, /balance, /help)",
                     args.telegram_token, args.chat_id)
             
             # Start Flask in a thread
