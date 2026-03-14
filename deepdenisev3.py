@@ -2030,7 +2030,8 @@ if __name__ == "__main__":
             
             # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-            # ===== ADD TELEGRAM LISTENER HERE =====
+            
+            # ===== TELEGRAM LISTENER =====
             if CMD_ARGS.telegram_token and CMD_ARGS.chat_id:
                 threading.Thread(
                     target=start_telegram_listener,
@@ -2039,6 +2040,7 @@ if __name__ == "__main__":
                 ).start()
                 log("📱 Telegram command listener activated (/restart, /status, /balance, /help)", 
                     args.telegram_token, args.chat_id)
+            
             # Start Flask in a thread
             flask_thread = threading.Thread(
                 target=app.run,
@@ -2074,6 +2076,12 @@ if __name__ == "__main__":
             log("Bot stopped cleanly (no restart flag)", args.telegram_token, args.chat_id)
             break
         
+        except SystemExit:
+            # This catches sys.exit() from graceful_shutdown
+            log("🔄 System exit caught - restarting bot...", args.telegram_token, args.chat_id)
+            time.sleep(2)
+            continue
+            
         except Exception as e:
             error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
             try:
