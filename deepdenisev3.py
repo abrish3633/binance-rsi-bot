@@ -1257,30 +1257,30 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             last_month = current_date.month
 
     def daily_restart_job():
-        """Clean daily restart at 00:02 UTC using restart flag"""
-        global bot_state
+        """Perform a clean scheduled restart of the bot process."""
+        global bot_state, bot_token, chat_id
         
-        # Use lock to prevent multiple restart requests
+        # Set restart flag BEFORE anything else
         with bot_state._restart_lock:
-            if bot_state.RESTART_REQUESTED:
-                return  # Already requested, skip
             bot_state.RESTART_REQUESTED = True
         
-        log("🔄 DAILY RESTART: Starting scheduled restart...", bot_token, chat_id)
-        telegram_post(bot_token, chat_id, "🔄 Daily restart in 10 seconds - orders remain active")
+        log("🔄 DAILY RESTART: Preparing to restart bot...", bot_token, chat_id)
+        telegram_post(bot_token, chat_id, "🔄 Daily restart initiated. Bot restarting...")
         
-        # Save state before restart
-        save_bot_state()
-        log("💾 State saved - trades preserved", bot_token, chat_id)
+        try:
+            # Save bot state
+            save_bot_state()
+            log("💾 Bot state saved successfully", bot_token, chat_id)
+        except Exception as e:
+            log(f"⚠️ State save error before restart: {e}", bot_token, chat_id)
         
-        # Log that orders remain active
-        log("✅ Orders remain active on Binance - SL/TP untouched", bot_token, chat_id)
+        # Give time for logs / telegram messages
+        time.sleep(2)
         
-        # Wait for logs to send
-        time.sleep(10)
+        log("🚀 Restarting Python process now...", bot_token, chat_id)
         
-        log("Restart flag set - main loop will restart shortly", bot_token, chat_id)
-        # DO NOT exit - just set flag and let main loop handle it
+        # ===== REAL PROCESS RESTART =====
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     
     # Schedule all jobs
     schedule.every().day.at("00:00").do(daily_reset_job)
@@ -1894,7 +1894,7 @@ if __name__ == "__main__":
     _shutdown_done = False
     
     def graceful_shutdown(sig=None, frame=None):
-        global _shutdown_done
+        global _shutdown_done, bot_state, args
         if _shutdown_done:
             return
         _shutdown_done = True
@@ -1910,29 +1910,36 @@ if __name__ == "__main__":
         # Save state before shutdown
         save_bot_state()
         
-        # Close any open position and cancel orders
-        if bot_state.client and args.symbol:
-            try:
-                # Check if there's an active position
-                pos_amt = get_position_amt(bot_state.client, args.symbol)
-                if pos_amt != Decimal('0'):
-                    log(f"Closing open position...", args.telegram_token, args.chat_id)
-                    side = "SELL" if pos_amt > Decimal('0') else "BUY"
-                    qty = abs(pos_amt)
-                    bot_state.client.send_signed_request("POST", "/fapi/v1/order", {
-                        "symbol": args.symbol,
-                        "side": side,
-                        "type": "MARKET",
-                        "quantity": str(qty)
-                    })
-                    time.sleep(1)
-                
-                # Cancel all orders (ZOMBIE KILLER)
-                log(f"Cleaning up orders...", args.telegram_token, args.chat_id)
-                bot_state.client.cancel_all_open_orders(args.symbol)
-                
-            except Exception as e:
-                log(f"Cleanup error: {e}", args.telegram_token, args.chat_id)
+        # ===== SKIP position closing if this is a scheduled restart =====
+        is_restart = getattr(bot_state, "RESTART_REQUESTED", False)
+        
+        if not is_restart:
+            # Normal shutdown - close positions and cancel orders
+            if bot_state.client and args.symbol:
+                try:
+                    # Check if there's an active position
+                    pos_amt = get_position_amt(bot_state.client, args.symbol)
+                    if pos_amt != Decimal('0'):
+                        log(f"Closing open position...", args.telegram_token, args.chat_id)
+                        side = "SELL" if pos_amt > Decimal('0') else "BUY"
+                        qty = abs(pos_amt)
+                        bot_state.client.send_signed_request("POST", "/fapi/v1/order", {
+                            "symbol": args.symbol,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": str(qty)
+                        })
+                        time.sleep(1)
+                    
+                    # Cancel all orders (ZOMBIE KILLER)
+                    log(f"Cleaning up orders...", args.telegram_token, args.chat_id)
+                    bot_state.client.cancel_all_open_orders(args.symbol)
+                    
+                except Exception as e:
+                    log(f"Cleanup error: {e}", args.telegram_token, args.chat_id)
+        else:
+            log("Scheduled restart detected — skipping position close", 
+                args.telegram_token, args.chat_id)
         
         # Final goodbye
         goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
@@ -1950,11 +1957,10 @@ if __name__ == "__main__":
         except:
             pass
         
-        # ===== FIX: If this is a restart, don't exit =====
-        if bot_state.RESTART_REQUESTED:
-            log("Restart in progress - returning to main loop", args.telegram_token, args.chat_id)
-            bot_state.RESTART_REQUESTED = False  # Reset flag
-            return  # Return to main loop instead of exiting
+        # ===== IMPORTANT: Reset flag before exit =====
+        if is_restart:
+            with bot_state._restart_lock:
+                bot_state.RESTART_REQUESTED = False
         
         sys.exit(0)
 
@@ -2011,7 +2017,8 @@ if __name__ == "__main__":
             recover_existing_positions(bot_state.client, args.symbol, tick_size, 
                                       args.telegram_token, args.chat_id)
             log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)
-            
+            log("🤖 Bot started successfully after restart", args.telegram_token, args.chat_id)
+            telegram_post(args.telegram_token, args.chat_id, "🤖 Bot restarted successfully")
             # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
