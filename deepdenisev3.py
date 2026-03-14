@@ -1865,27 +1865,6 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text("❓ Unknown command. Try /help")
 
-def start_telegram_listener():
-    """Start async Telegram bot in a separate thread"""
-    global CMD_ARGS
-    
-    # Create event loop for this thread
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Build application
-    application = Application.builder().token(CMD_ARGS.telegram_token).build()
-    
-    # Register commands (only the ones we need)
-    application.add_handler(CommandHandler("restart", cmd_restart))
-    application.add_handler(CommandHandler("status", cmd_status))
-    application.add_handler(CommandHandler("balance", cmd_balance))
-    application.add_handler(CommandHandler("help", cmd_help))
-    
-    log("📱 Telegram command listener starting...", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
-    
-    # Run polling
-    application.run_polling(drop_pending_updates=True, stop_signals=None)
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures Bot - Webhook Mode with Immediate Trailing Stop")
@@ -2036,9 +2015,9 @@ if __name__ == "__main__":
             # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
-            # ===== TELEGRAM LISTENER =====
+                        # ===== TELEGRAM LISTENER =====
             if CMD_ARGS.telegram_token and CMD_ARGS.chat_id:
-                # Clean up any old webhook/polling sessions first (prevents 409 Conflict)
+                # Clean up old sessions
                 try:
                     requests.post(
                         f"https://api.telegram.org/bot{CMD_ARGS.telegram_token}/deleteWebhook",
@@ -2046,13 +2025,44 @@ if __name__ == "__main__":
                     )
                     log("Cleaned up any old Telegram webhook/polling sessions",
                         CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                    
+                    # Wait for Telegram to process the deletion (very helpful)
+                    time.sleep(3)  # ← increased to 3s for safety
+                    
                 except Exception as e:
                     log(f"Cleanup old Telegram sessions failed (usually harmless): {e}",
                         CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
                 
-                # Start the listener
+                # Start listener with built-in retry on conflict
+                def start_telegram_listener_with_retry():
+                    retry_count = 0
+                    while retry_count < 5:  # allow more retries
+                        try:
+                            application = Application.builder().token(CMD_ARGS.telegram_token).build()
+                            
+                            # Your command handlers here
+                            application.add_handler(CommandHandler("restart", cmd_restart))
+                            application.add_handler(CommandHandler("status", cmd_status))
+                            # ... other handlers ...
+                            
+                            log("📱 Telegram listener starting (attempt {retry_count+1})...", 
+                                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            
+                            application.run_polling(drop_pending_updates=True, stop_signals=None)
+                            break  # success
+                            
+                        except telegram.error.Conflict as e:
+                            retry_count += 1
+                            log(f"Telegram conflict (attempt {retry_count}/5) - retrying in 5s...",
+                                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            time.sleep(5)
+                        except Exception as e:
+                            log(f"Telegram listener fatal error: {e}", 
+                                CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+                            break
+                
                 threading.Thread(
-                    target=start_telegram_listener,
+                    target=start_telegram_listener_with_retry,
                     daemon=True,
                     name="TelegramListener"
                 ).start()
