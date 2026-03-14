@@ -1223,6 +1223,28 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
         except Exception as e:
             log(f"Daily reset failed: {e}", bot_token, chat_id)
     
+    def daily_memory_log():
+        """Log current memory usage once per day at 12:00 UTC"""
+        import psutil
+        
+        try:
+            process = psutil.Process()
+            mem_mb = process.memory_info().rss / 1024 / 1024
+            
+            # Get object count (optional)
+            import gc
+            obj_count = len(gc.get_objects())
+            
+            log(f"📊 DAILY MEMORY USAGE: {mem_mb:.1f} MB | Objects: {obj_count:,}", 
+                bot_token, chat_id)
+            
+            # Alert if memory is getting high
+            if mem_mb > 800:
+                log(f"⚠️ High memory warning: {mem_mb:.1f} MB", bot_token, chat_id)
+                
+        except Exception as e:
+            log(f"❌ Memory log error: {e}", bot_token, chat_id)
+
     def weekly_reset_job():
         bot_state.CONSEC_LOSSES = 0
         bot_state.consec_loss_guard_alert_sent = False
@@ -1265,6 +1287,7 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
     schedule.every().day.at("00:00").do(daily_reset_job)
     schedule.every().monday.at("00:00").do(weekly_reset_job)
     schedule.every().day.at("00:01").do(check_monthly_report)
+    schedule.every().day.at("00:01").do(daily_memory_log)  # ← ADD THIS
     schedule.every().day.at("00:02").do(daily_restart_job)  # Daily restart at 00:02
     schedule.every().day.at("23:59").do(lambda: send_daily_report(bot_token, chat_id))
     schedule.every().sunday.at("23:59").do(lambda: send_weekly_report(bot_token, chat_id))
@@ -1854,16 +1877,15 @@ def start_telegram_listener():
     # Build application
     application = Application.builder().token(CMD_ARGS.telegram_token).build()
     
-    # Register commands
+    # Register commands (only the ones we need)
     application.add_handler(CommandHandler("restart", cmd_restart))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("balance", cmd_balance))
     application.add_handler(CommandHandler("help", cmd_help))
-    application.add_handler(MessageHandler(filters.COMMAND, unknown))
     
     log("📱 Telegram command listener starting...", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
     
-    # Run polling (this blocks)
+    # Run polling
     application.run_polling(drop_pending_updates=True, stop_signals=None)
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
