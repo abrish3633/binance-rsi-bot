@@ -26,7 +26,10 @@ import platform
 import numpy as np
 from flask import Flask, request, jsonify
 import io
-
+# ==================== TELEGRAM COMMAND LISTENER ====================
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import asyncio
 # Fix Windows console encoding
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -138,6 +141,9 @@ class BotState:
         # ADD THESE TWO LINES:
         self.RESTART_REQUESTED = False
         self._restart_lock = threading.Lock()
+
+        # ADD THIS LINE:
+        self.start_time = datetime.now(timezone.utc)
 
 bot_state = BotState()
 
@@ -1735,6 +1741,130 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
                     telegram_bot, telegram_chat_id)
     except Exception as e:
         log(f"❌ Position recovery error: {e}", telegram_bot, telegram_chat_id)
+
+# ==================== TELEGRAM COMMAND HANDLERS ====================
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /restart — triggers clean bot restart"""
+    global bot_state, CMD_ARGS
+    
+    chat_id = str(update.effective_chat.id)
+    user_id = str(update.effective_user.id)
+    
+    # Security: Only allow your chat ID
+    if chat_id != str(CMD_ARGS.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    await update.message.reply_text("🔄 Restart requested... cleaning up and restarting in 5 seconds.")
+    
+    # Set the restart flag with lock
+    with bot_state._restart_lock:
+        bot_state.RESTART_REQUESTED = True
+    
+    # Save state immediately
+    save_bot_state()
+    
+    log("🔧 MANUAL RESTART triggered via Telegram /restart", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+    
+    # Small delay to ensure message sends
+    await asyncio.sleep(2)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /status — quick bot health check"""
+    global bot_state, CMD_ARGS
+    
+    chat_id = str(update.effective_chat.id)
+    
+    # Security: Only allow your chat ID
+    if chat_id != str(CMD_ARGS.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    # Get current status
+    balance = fetch_balance(bot_state.client) if bot_state.client else Decimal("0")
+    pos_amt = get_position_amt(bot_state.client, CMD_ARGS.symbol) if bot_state.client else Decimal("0")
+    
+    # Get memory usage
+    import psutil
+    process = psutil.Process()
+    mem_mb = process.memory_info().rss / 1024 / 1024
+    
+    status_lines = [
+        f"🤖 *DeepDenise Status*",
+        f"",
+        f"📊 *Balance:* `${float(balance):.2f}`",
+        f"📈 *Position:* `{float(pos_amt):.2f} SOL`",
+        f"🔄 *Active Trade:* `{'Yes' if bot_state.current_trade and bot_state.current_trade.active else 'No'}`",
+        f"🚩 *Restart Flag:* `{bot_state.RESTART_REQUESTED}`",
+        f"💾 *Trades Stored:* `{len(bot_state.pnl_data)}`",
+        f"🧠 *Memory:* `{mem_mb:.1f} MB`",
+        f"🆔 *PID:* `{os.getpid()}`",
+        f"⏰ *Uptime:* `{datetime.now(timezone.utc) - bot_state.start_time}`" if hasattr(bot_state, 'start_time') else ""
+    ]
+    
+    await update.message.reply_text("\n".join(status_lines), parse_mode='Markdown')
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /balance — show current balance only"""
+    global bot_state, CMD_ARGS
+    
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(CMD_ARGS.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    balance = fetch_balance(bot_state.client) if bot_state.client else Decimal("0")
+    await update.message.reply_text(f"💰 Current Balance: `${float(balance):.2f}` USDT")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command: /help — show available commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(CMD_ARGS.chat_id):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+    
+    help_text = (
+        "🤖 *Available Commands:*\n\n"
+        "/status - Show bot status (balance, position, memory)\n"
+        "/balance - Show current balance only\n"
+        "/restart - Gracefully restart the bot\n"
+        "/help - Show this help message"
+    )
+    await update.message.reply_text(help_text, parse_mode='Markdown')
+
+async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle unknown commands"""
+    chat_id = str(update.effective_chat.id)
+    
+    if chat_id != str(CMD_ARGS.chat_id):
+        return
+    
+    await update.message.reply_text("❓ Unknown command. Try /help")
+
+def start_telegram_listener():
+    """Start async Telegram bot in a separate thread"""
+    global CMD_ARGS
+    
+    # Create event loop for this thread
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Build application
+    application = Application.builder().token(CMD_ARGS.telegram_token).build()
+    
+    # Register commands
+    application.add_handler(CommandHandler("restart", cmd_restart))
+    application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("balance", cmd_balance))
+    application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(MessageHandler(filters.COMMAND, unknown))
+    
+    log("📱 Telegram command listener starting...", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+    
+    # Run polling (this blocks)
+    application.run_polling(drop_pending_updates=True, stop_signals=None)
 # ------------------- MAIN -------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Binance Futures Bot - Webhook Mode with Immediate Trailing Stop")
@@ -1878,7 +2008,15 @@ if __name__ == "__main__":
             
             # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-            
+            # ===== ADD TELEGRAM LISTENER HERE =====
+            if CMD_ARGS.telegram_token and CMD_ARGS.chat_id:
+                threading.Thread(
+                    target=start_telegram_listener,
+                    daemon=True,
+                    name="TelegramListener"
+                ).start()
+                log("📱 Telegram command listener activated (/restart, /status, /balance, /help)", 
+                    args.telegram_token, args.chat_id)
             # Start Flask in a thread
             flask_thread = threading.Thread(
                 target=app.run,
