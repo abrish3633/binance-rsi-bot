@@ -1972,6 +1972,12 @@ if __name__ == "__main__":
         except:
             pass
         
+        # ===== FIX: If this is a restart, don't exit =====
+        if bot_state.RESTART_REQUESTED:
+            log("Restart in progress - returning to main loop", args.telegram_token, args.chat_id)
+            bot_state.RESTART_REQUESTED = False  # Reset flag
+            return  # Return to main loop instead of exiting
+        
         sys.exit(0)
 
     signal.signal(signal.SIGINT, graceful_shutdown)
