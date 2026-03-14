@@ -1088,16 +1088,15 @@ def trading_loop(client: BinanceClient, symbol: str, telegram_bot: Optional[str]
     log("Entering trading_loop - monitoring active", telegram_bot, telegram_chat_id)
     
     while not bot_state.STOP_REQUESTED and not os.path.exists("stop.txt"):
-        # ===== CRITICAL FIX: Check restart flag every iteration =====
+        # ONLY CHECK — do NOT reset here!
         with bot_state._restart_lock:
             if bot_state.RESTART_REQUESTED:
                 log("🔄 Restart requested inside trading_loop - exiting loop cleanly",
                     telegram_bot, telegram_chat_id)
-                bot_state.RESTART_REQUESTED = False
-                return  # Exit function → main loop restarts
-        
-        time.sleep(1)  # Just keep thread alive, monitoring is handled separately
-    
+                return   # ← exit function, leave flag True for main loop to see
+
+        time.sleep(1)
+
     log("Trading loop exited.", telegram_bot, telegram_chat_id)
 # ------------------- PNL REPORT FUNCTIONS -------------------
 def calculate_pnl_report(period: str) -> str:
@@ -2070,7 +2069,9 @@ if __name__ == "__main__":
             # This log proves trading_loop exited (rare, but useful for debug)
             log("trading_loop() has returned - checking for restart flag",
                 args.telegram_token, args.chat_id)
-            
+            # Debug: show flag state right after loop exits
+            log(f"trading_loop() exited | RESTART_REQUESTED = {bot_state.RESTART_REQUESTED}",
+                args.telegram_token, args.chat_id)
             # Check restart flag after trading_loop exits (redundant but safe)
             with bot_state._restart_lock:
                 if bot_state.RESTART_REQUESTED:
