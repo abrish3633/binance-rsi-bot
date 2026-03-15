@@ -1257,29 +1257,47 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             last_month = current_date.month
 
     def daily_restart_job():
-        """Perform a clean scheduled restart of the bot process."""
-        global bot_state, bot_token, chat_id
+        """Safe daily restart - preserves positions, really restarts process"""
+        global bot_state
         
-        # Set restart flag BEFORE anything else
-        with bot_state._restart_lock:
-            bot_state.RESTART_REQUESTED = True
+        # Check for active position
+        has_position = False
+        position_details = ""
+        if (bot_state.client and bot_state.current_trade and 
+            bot_state.current_trade.active and bot_state.current_trade.qty):
+            has_position = True
+            position_details = (f"{bot_state.current_trade.side} "
+                               f"{bot_state.current_trade.qty} SOL "
+                               f"@ {bot_state.current_trade.entry_price:.2f}")
         
-        log("🔄 DAILY RESTART: Preparing to restart bot...", bot_token, chat_id)
-        telegram_post(bot_token, chat_id, "🔄 Daily restart initiated. Bot restarting...")
+        log("🔄 DAILY RESTART: Starting real process restart...", 
+            args.telegram_token, args.chat_id)
         
+        # Save state
         try:
-            # Save bot state
             save_bot_state()
-            log("💾 Bot state saved successfully", bot_token, chat_id)
+            log("💾 State saved - trades preserved", args.telegram_token, args.chat_id)
         except Exception as e:
-            log(f"⚠️ State save error before restart: {e}", bot_token, chat_id)
+            log(f"⚠️ State save warning: {e}", args.telegram_token, args.chat_id)
         
-        # Give time for logs / telegram messages
-        time.sleep(2)
+        # Notify about position status
+        if has_position:
+            msg = (f"🔄 Daily restart - POSITION PRESERVED!\n"
+                   f"{position_details}\n"
+                   f"SL/TP orders remain active on Binance")
+            telegram_post(args.telegram_token, args.chat_id, msg)
+            log(f"✅ Active position preserved: {position_details}", 
+                args.telegram_token, args.chat_id)
+        else:
+            telegram_post(args.telegram_token, args.chat_id, 
+                         "🔄 Daily restart - no active positions")
         
-        log("🚀 Restarting Python process now...", bot_token, chat_id)
+        time.sleep(2)  # Let messages send
         
         # ===== REAL PROCESS RESTART =====
+        log("🚀 Restarting Python process NOW - positions safe on Binance", 
+            args.telegram_token, args.chat_id)
+        import os, sys
         os.execv(sys.executable, [sys.executable] + sys.argv)
     
     # Schedule all jobs
@@ -1766,31 +1784,53 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Command: /restart — triggers clean bot restart"""
+    """Telegram /restart - safely restarts bot, preserves positions"""
     global bot_state, CMD_ARGS
     
     chat_id = str(update.effective_chat.id)
-    user_id = str(update.effective_user.id)
     
-    # Security: Only allow your chat ID
+    # Security check
     if chat_id != str(CMD_ARGS.chat_id):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
-    await update.message.reply_text("🔄 Restart requested... cleaning up and restarting in 5 seconds.")
+    # Check for active position
+    has_position = False
+    position_details = ""
+    if (bot_state.client and bot_state.current_trade and 
+        bot_state.current_trade.active and bot_state.current_trade.qty):
+        has_position = True
+        position_details = (f"{bot_state.current_trade.side} "
+                           f"{bot_state.current_trade.qty} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.2f}")
     
-    # Set the restart flag with lock
-    with bot_state._restart_lock:
-        bot_state.RESTART_REQUESTED = True
+    # Reply with position info
+    if has_position:
+        await update.message.reply_text(
+            f"🔄 *Restarting with ACTIVE POSITION*\n\n"
+            f"📊 *Position:* {position_details}\n"
+            f"🛡️ *SL/TP orders stay on Binance*\n"
+            f"🤖 Bot will resume monitoring after restart\n\n"
+            f"Restarting in 2 seconds...",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("🔄 Restarting bot now...")
     
-    # Save state immediately
-    save_bot_state()
+    # Save state
+    try:
+        save_bot_state()
+        await update.message.reply_text("💾 Trade history saved")
+    except:
+        await update.message.reply_text("⚠️ Save warning - restarting anyway")
     
-    log("🔧 MANUAL RESTART triggered via Telegram /restart", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+    log("🔧 Manual restart via Telegram", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
     
-    # Small delay to ensure message sends
-    await asyncio.sleep(2)
-
+    await asyncio.sleep(2)  # Let messages send
+    
+    # ===== REAL PROCESS RESTART =====
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
     global bot_state, CMD_ARGS
@@ -1976,22 +2016,6 @@ if __name__ == "__main__":
             graceful_shutdown()
             break
         
-        # Check if restart was requested by scheduler
-        if hasattr(bot_state, 'RESTART_REQUESTED') and hasattr(bot_state, '_restart_lock'):
-            with bot_state._restart_lock:
-                if bot_state.RESTART_REQUESTED:
-                    log("🔄 Restart flag detected - performing clean restart", 
-                        args.telegram_token, args.chat_id)
-                    bot_state.RESTART_REQUESTED = False  # Reset flag
-                    
-                    # Save state before restart
-                    save_bot_state()
-                    log("💾 State saved - restarting...", args.telegram_token, args.chat_id)
-                    
-                    # Small delay before restart
-                    time.sleep(2)
-                    continue  # This restarts the entire try block
-        
         try:
             bot_state.client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
             balance = fetch_balance(bot_state.client)
@@ -2017,6 +2041,10 @@ if __name__ == "__main__":
             recover_existing_positions(bot_state.client, args.symbol, tick_size, 
                                       args.telegram_token, args.chat_id)
             log(f"🚀 Bot started - PID: {os.getpid()}", args.telegram_token, args.chat_id)
+            # Add memory usage on startup
+            import psutil
+            mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
+            log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             log("🤖 Bot started successfully after restart", args.telegram_token, args.chat_id)
             telegram_post(args.telegram_token, args.chat_id, "🤖 Bot restarted successfully")
             # Start scheduler thread
