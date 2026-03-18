@@ -2050,7 +2050,6 @@ if __name__ == "__main__":
         goodbye = (
             f"RSI BOT STOPPED\n"
             f"Symbol: {symbol}\n"
-            f"Timeframe: {args.timeframe}\n"
             f"Reason: {reason}\n"
             f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
         )
