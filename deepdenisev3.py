@@ -2119,7 +2119,26 @@ if __name__ == "__main__":
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+                        threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
+            # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
+            import socket
+            from werkzeug.serving import make_server
+            
+            # Create socket with SO_REUSEADDR
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('0.0.0.0', args.port))
+            sock.listen(128)
+            
+            # Create server with pre-bound socket
+            server = make_server('0.0.0.0', args.port, app, threaded=True, request_handler=None)
+            server.socket = sock
+            
+            # Run in thread
+            flask_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            flask_thread.start()
+            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", args.telegram_token, args.chat_id)
             # TELEGRAM IN MAIN THREAD - BLOCKING
             if args.telegram_token and args.chat_id:
                 try:
