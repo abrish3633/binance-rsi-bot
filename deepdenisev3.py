@@ -2119,8 +2119,7 @@ if __name__ == "__main__":
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-                        threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-            
+        
             # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
             import socket
             from werkzeug.serving import make_server
