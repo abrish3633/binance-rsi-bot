@@ -1885,7 +1885,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error closing lock handle during restart: {e}")
     
     # Small delay to ensure everything is cleaned up
-    time.sleep(1)
+    time.sleep(3)
     
     # ===== REAL PROCESS RESTART =====
     import os, sys
@@ -2167,7 +2167,13 @@ if __name__ == "__main__":
             # Start Flask in a thread
             flask_thread = threading.Thread(
                 target=app.run,
-                kwargs={'host': '0.0.0.0', 'port': args.port, 'debug': False, 'use_reloader': False},
+                kwargs={
+                    'host': '0.0.0.0', 
+                    'port': args.port, 
+                    'debug': False, 
+                    'use_reloader': False,
+                    'options': {'reuse_addr': True}  # ← ADD THIS LINE
+                },
                 daemon=True
             )
             flask_thread.start()
