@@ -188,37 +188,33 @@ def acquire_lock():
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
                         
-                        # Special case: if it's the same PID as current process, it's a restart
-                        if pid == os.getpid():
-                            print(f"Same PID {pid} - this is a restart, continuing...")
-                            # Just use the existing lock file
-                            pass
+                        # Check if process is still running
+                        process_exists = False
+                        if platform.system() == "Windows":
+                            import psutil
+                            try:
+                                psutil.Process(pid)
+                                process_exists = True
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                process_exists = False
                         else:
-                            # Check if process is still running
-                            process_exists = False
-                            if platform.system() == "Windows":
-                                import psutil
-                                try:
-                                    psutil.Process(pid)
-                                    process_exists = True
-                                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                    process_exists = False
-                            else:
-                                # Unix: try sending signal 0 to check if process exists
-                                try:
-                                    os.kill(pid, 0)
-                                    process_exists = True
-                                except OSError:
-                                    process_exists = False
-                            
-                            if process_exists:
-                                # Process exists, another instance is running
-                                print(f"Another instance is already running with PID {pid}! Exiting.")
-                                sys.exit(1)
-                            else:
-                                # Process doesn't exist, stale lock file
-                                print(f"Removing stale lock file from PID {pid}")
-                                os.unlink(LOCK_FILE)
+                            # Unix: try sending signal 0 to check if process exists
+                            try:
+                                os.kill(pid, 0)
+                                process_exists = True
+                            except OSError:
+                                process_exists = False
+                        
+                        if process_exists:
+                            # Process exists, another instance is running
+                            msg = f"Another instance already running with PID {pid}! Exiting."
+                            log(msg, args.telegram_token, args.chat_id)
+                            print(msg)
+                            sys.exit(1)
+                        else:
+                            # Stale lock - remove
+                            log(f"Removing stale lock from dead PID {pid}", args.telegram_token, args.chat_id)
+                            os.unlink(LOCK_FILE)
             except Exception as e:
                 print(f"Error reading lock file: {e}")
                 # If we can't read/parse the lock file, remove it and continue
@@ -1994,16 +1990,8 @@ if __name__ == "__main__":
     # Shutdown handler (improved - early lock cleanup, sys.exit)
     _shutdown_done = False
     
-    def graceful_shutdown(sig: Optional[int] = None, frame: Any = None, 
-                          symbol: Optional[str] = None, 
-                          telegram_bot: Optional[str] = None, 
-                          telegram_chat_id: Optional[str] = None):
+    def graceful_shutdown(sig=None, frame=None):
         global _shutdown_done, bot_state, args, LOCK_HANDLE
-        
-        # Use passed values or fall back to args
-        symbol = symbol or args.symbol
-        telegram_bot = telegram_bot or args.telegram_token
-        telegram_chat_id = telegram_chat_id or args.chat_id
         
         if _shutdown_done:
             return
@@ -2011,86 +1999,71 @@ if __name__ == "__main__":
         
         reason = {
             signal.SIGINT: "Ctrl+C",
-            signal.SIGTERM: "SIGTERM / systemd",
+            signal.SIGTERM: "SIGTERM",
         }.get(sig, "Clean exit")
         
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
         
-        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
-            telegram_bot, telegram_chat_id)
+        is_restart = getattr(bot_state, "RESTART_REQUESTED", False)
         
-        # Save state before shutdown
+        log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
+            args.telegram_token, args.chat_id)
+        
+        # EARLY lock cleanup - ALWAYS remove lock file on restart/shutdown
+        try:
+            if 'LOCK_HANDLE' in globals() and LOCK_HANDLE:
+                try:
+                    LOCK_HANDLE.close()
+                except:
+                    pass
+            if os.path.exists(LOCK_FILE):
+                os.unlink(LOCK_FILE)
+                log("Lock file removed during shutdown", args.telegram_token, args.chat_id)
+        except Exception as e:
+            log(f"Lock cleanup error: {e}", args.telegram_token, args.chat_id)
+        
+        # Save state
         save_bot_state()
         
-        # Check for active position
+        # Preserve position if restart
         has_active_position = False
         pos_amt = Decimal('0')
-        
-        if bot_state.client and symbol:
+        if bot_state.client and args.symbol:
             try:
-                pos_amt = get_position_amt(bot_state.client, symbol, telegram_bot, telegram_chat_id)
+                pos_amt = get_position_amt(bot_state.client, args.symbol)
                 has_active_position = pos_amt != Decimal('0')
             except:
                 pass
         
         if has_active_position:
-            log("🔄 RESTARTING WITH ACTIVE POSITION - PRESERVING POSITION", 
-                telegram_bot, telegram_chat_id)
-            log(f"✅ Position: {abs(float(pos_amt)):.2f} SOL remains open - orders stay on Binance", 
-                telegram_bot, telegram_chat_id)
+            log("🔄 Restart detected - preserving active position", 
+                args.telegram_token, args.chat_id)
+            log(f"Position preserved: {abs(float(pos_amt)):.2f} SOL", 
+                args.telegram_token, args.chat_id)
         else:
-            log("Normal shutdown - cleaning up orders", telegram_bot, telegram_chat_id)
-            if bot_state.client and symbol:
+            if bot_state.client and args.symbol:
                 try:
-                    bot_state.client.cancel_all_open_orders(symbol)
+                    bot_state.client.cancel_all_open_orders(args.symbol)
                 except Exception as e:
-                    log(f"Order cleanup error: {e}", telegram_bot, telegram_chat_id)
+                    log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
         
-        goodbye = (
-            f"RSI BOT STOPPED\n"
-            f"Symbol: {symbol}\n"
-            f"Reason: {reason}\n"
-            f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
-        )
-        
-        if has_active_position:
-            goodbye += "\n✅ POSITION PRESERVED - Orders remain active"
+        goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
+        if is_restart:
+            goodbye += "\n🔄 Restarting with new process..."
         
         try:
-            log(goodbye, telegram_bot, telegram_chat_id)
-        except Exception as e:
-            print(f"Error during goodbye log: {e}")
+            log(goodbye, args.telegram_token, args.chat_id)
+        except:
+            pass
         
-        # Only clean lock file on actual shutdown (signal received), not during restart
-        # sig is None when called from atexit (restart), not None when from signal
-        if sig is not None:
-            try:
-                if LOCK_HANDLE:
-                    try:
-                        LOCK_HANDLE.close()
-                    except:
-                        pass
-                if os.path.exists(LOCK_FILE):
-                    os.unlink(LOCK_FILE)
-                    log(f"Lock file removed: {LOCK_FILE}", telegram_bot, telegram_chat_id)
-            except Exception as e:
-                print(f"Error cleaning lock file: {e}")
-        
-        # Remove kill flag
-        try:
-            if os.path.exists("/tmp/STOP_BOT_NOW"):
-                os.unlink("/tmp/STOP_BOT_NOW")
-        except Exception as e:
-            print(f"Error removing kill flag: {e}")
-        
-        os._exit(0)
-    def signal_handler_wrapper(sig, frame):
-        graceful_shutdown(sig, frame, args.symbol, args.telegram_token, args.chat_id)
-    
-    signal.signal(signal.SIGINT, signal_handler_wrapper)
-    signal.signal(signal.SIGTERM, signal_handler_wrapper)
-    atexit.register(lambda: graceful_shutdown(None, None, args.symbol, args.telegram_token, args.chat_id))
+        # On restart: force new PID by killing self after cleanup
+        if is_restart:
+            log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
+            time.sleep(2)  # Give logs time to send
+            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
+        else:
+            sys.exit(0)  # Normal shutdown
     
     # Immortal loop
     while True:
@@ -2147,27 +2120,8 @@ if __name__ == "__main__":
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
-            # ========== START FLASK WEBHOOK SERVER ==========
-            import socket
-            from werkzeug.serving import make_server
-            
-            # Create socket with SO_REUSEADDR
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(('0.0.0.0', args.port))
-            sock.listen(128)
-            
-            # Create server with pre-bound socket
-            server = make_server('0.0.0.0', args.port, app, threaded=True, request_handler=None)
-            server.socket = sock
-            
-            # Run in thread
-            flask_thread = threading.Thread(target=server.serve_forever, daemon=True)
-            flask_thread.start()
-            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", args.telegram_token, args.chat_id)
-            # ========== TELEGRAM LISTENER - RUNNING IN MAIN THREAD ==========
+            # TELEGRAM IN MAIN THREAD - BLOCKING
             if args.telegram_token and args.chat_id:
-                # Clean up old sessions
                 try:
                     requests.post(
                         f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
@@ -2177,30 +2131,18 @@ if __name__ == "__main__":
                         args.telegram_token, args.chat_id)
                     time.sleep(2)
                 except Exception as e:
-                    log(f"Cleanup old Telegram sessions failed (usually harmless): {e}",
+                    log(f"Cleanup old Telegram sessions failed: {e}",
                         args.telegram_token, args.chat_id)
-
-                # Build the application
-                from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-                from telegram import Update
                 
                 application = Application.builder().token(args.telegram_token).build()
-
-                # Add command handlers
+                
                 application.add_handler(CommandHandler("restart", cmd_restart))
                 application.add_handler(CommandHandler("status", cmd_status))
-                application.add_handler(CommandHandler("help", cmd_help))
+                # ... other handlers ...
                 
-                # Handle unknown commands
-                async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                    if update.message and update.message.text and update.message.text.startswith('/'):
-                        await update.message.reply_text("❓ Unknown command. Try /help")
-                application.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-                log("📱 Telegram command listener starting in main thread (/restart, /status, /help)",
+                log("📱 Telegram command listener starting in main thread (/restart, /status, ...)",
                     args.telegram_token, args.chat_id)
-
-                # Run polling in main thread (blocks until shutdown)
+                
                 try:
                     application.run_polling(
                         drop_pending_updates=True,
@@ -2210,16 +2152,22 @@ if __name__ == "__main__":
                 except Exception as e:
                     log(f"Telegram polling stopped: {e}", args.telegram_token, args.chat_id)
             
-            # This line will only be reached if Telegram polling stops
-            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
-            break
-        
+            # Trading loop in daemon thread
+            trading_thread = threading.Thread(
+                target=trading_loop,
+                args=(bot_state.client, args.symbol, args.telegram_token, args.chat_id),
+                daemon=True,
+                name="TradingLoop"
+            )
+            trading_thread.start()
+            log("🚀 Trading loop started in background thread", args.telegram_token, args.chat_id)
+            
+            # Main thread blocked by Telegram polling - loop continues on exit/restart
+            
         except Exception as e:
-            import traceback
             error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
             try:
                 log(error_msg, args.telegram_token, args.chat_id)
-                telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
-            except Exception as e2:
-                print(f"Error during crash logging: {e2}")
+            except:
+                print(error_msg)
             time.sleep(15)
