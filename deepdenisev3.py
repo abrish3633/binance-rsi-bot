@@ -1334,7 +1334,7 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             telegram_post(args.telegram_token, args.chat_id, 
                          "🔄 Daily restart - no active positions")
         
-        time.sleep(2)  # Let messages send
+        time.sleep(7)  # Let messages send
         
         # ===== REAL PROCESS RESTART =====
         log("🚀 Restarting Python process NOW - positions safe on Binance", 
