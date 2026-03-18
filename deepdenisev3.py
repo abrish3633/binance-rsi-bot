@@ -2148,8 +2148,27 @@ if __name__ == "__main__":
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
-            # TELEGRAM IN MAIN THREAD - BLOCKING
+            # ========== START FLASK WEBHOOK SERVER ==========
+            import socket
+            from werkzeug.serving import make_server
+            
+            # Create socket with SO_REUSEADDR
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('0.0.0.0', args.port))
+            sock.listen(128)
+            
+            # Create server with pre-bound socket
+            server = make_server('0.0.0.0', args.port, app, threaded=True, request_handler=None)
+            server.socket = sock
+            
+            # Run in thread
+            flask_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            flask_thread.start()
+            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", args.telegram_token, args.chat_id)
+            # ========== TELEGRAM LISTENER - RUNNING IN MAIN THREAD ==========
             if args.telegram_token and args.chat_id:
+                # Clean up old sessions
                 try:
                     requests.post(
                         f"https://api.telegram.org/bot{args.telegram_token}/deleteWebhook",
@@ -2159,18 +2178,30 @@ if __name__ == "__main__":
                         args.telegram_token, args.chat_id)
                     time.sleep(2)
                 except Exception as e:
-                    log(f"Cleanup old Telegram sessions failed: {e}",
+                    log(f"Cleanup old Telegram sessions failed (usually harmless): {e}",
                         args.telegram_token, args.chat_id)
+
+                # Build the application
+                from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+                from telegram import Update
                 
                 application = Application.builder().token(args.telegram_token).build()
-                
+
+                # Add command handlers
                 application.add_handler(CommandHandler("restart", cmd_restart))
                 application.add_handler(CommandHandler("status", cmd_status))
-                # ... other handlers ...
+                application.add_handler(CommandHandler("help", cmd_help))
                 
-                log("📱 Telegram command listener starting in main thread (/restart, /status, ...)",
+                # Handle unknown commands
+                async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                    if update.message and update.message.text and update.message.text.startswith('/'):
+                        await update.message.reply_text("❓ Unknown command. Try /help")
+                application.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+                log("📱 Telegram command listener starting in main thread (/restart, /status, /help)",
                     args.telegram_token, args.chat_id)
-                
+
+                # Run polling in main thread (blocks until shutdown)
                 try:
                     application.run_polling(
                         drop_pending_updates=True,
@@ -2180,22 +2211,16 @@ if __name__ == "__main__":
                 except Exception as e:
                     log(f"Telegram polling stopped: {e}", args.telegram_token, args.chat_id)
             
-            # Trading loop in daemon thread
-            trading_thread = threading.Thread(
-                target=trading_loop,
-                args=(bot_state.client, args.symbol, args.telegram_token, args.chat_id),
-                daemon=True,
-                name="TradingLoop"
-            )
-            trading_thread.start()
-            log("🚀 Trading loop started in background thread", args.telegram_token, args.chat_id)
-            
-            # Main thread blocked by Telegram polling - loop continues on exit/restart
-            
+            # This line will only be reached if Telegram polling stops
+            log("Bot stopped cleanly – exiting.", args.telegram_token, args.chat_id)
+            break
+        
         except Exception as e:
+            import traceback
             error_msg = f"BOT CRASHED → RESTARTING IN 15s\n{traceback.format_exc()}"
             try:
                 log(error_msg, args.telegram_token, args.chat_id)
-            except:
-                print(error_msg)
+                telegram_post(args.telegram_token, args.chat_id, "BOT CRASHED – RESTARTING IN 15s")
+            except Exception as e2:
+                print(f"Error during crash logging: {e2}")
             time.sleep(15)
