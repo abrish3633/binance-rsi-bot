@@ -196,20 +196,39 @@ def acquire_lock():
                         else:
                             # Check if process is still running
                             process_exists = False
+                            
+                            # Better process checking
                             if platform.system() == "Windows":
                                 import psutil
                                 try:
-                                    psutil.Process(pid)
-                                    process_exists = True
+                                    # This is more reliable on Windows
+                                    process = psutil.Process(pid)
+                                    process_exists = process.is_running()
                                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                                     process_exists = False
                             else:
-                                # Unix: try sending signal 0 to check if process exists
+                                # On Linux/Unix, try multiple methods
                                 try:
-                                    os.kill(pid, 0)
-                                    process_exists = True
-                                except OSError:
-                                    process_exists = False
+                                    # Method 1: Check if /proc/PID exists (most reliable on Linux)
+                                    if os.path.exists(f"/proc/{pid}"):
+                                        # Double-check it's actually a python process (optional)
+                                        try:
+                                            with open(f"/proc/{pid}/cmdline", 'r') as cmd_file:
+                                                cmdline = cmd_file.read()
+                                                if 'python' in cmdline:
+                                                    process_exists = True
+                                        except:
+                                            # If we can't read cmdline but /proc exists, assume it's running
+                                            process_exists = True
+                                    else:
+                                        process_exists = False
+                                except:
+                                    # Fallback to kill -0 method
+                                    try:
+                                        os.kill(pid, 0)
+                                        process_exists = True
+                                    except OSError:
+                                        process_exists = False
                             
                             if process_exists:
                                 # Process exists, another instance is running
@@ -228,12 +247,13 @@ def acquire_lock():
                     pass
         
         # Create new lock file with current PID
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
             f.flush()
             os.fsync(f.fileno())  # Ensure it's written to disk
         
-        print(f"Lock file created with PID {os.getpid()}")
+        print(f"✅ Lock file created with PID {os.getpid()}")
         
         # On Unix systems, add file locking
         if platform.system() != "Windows":
@@ -241,13 +261,12 @@ def acquire_lock():
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                print(f"Exclusive file lock acquired")
+                print(f"✅ Exclusive file lock acquired")
                 # Keep lock file open while bot runs
                 return lock_handle
             except (IOError, OSError) as e:
-                print(f"Failed to acquire file lock: {e}")
-                # If we can't get the lock, another instance might have it
-                # Check if it's our own PID
+                print(f"⚠️ Failed to acquire file lock: {e}")
+                # If we can't get the lock, but it's our PID, continue anyway
                 with open(LOCK_FILE, 'r') as f:
                     file_pid = int(f.read().strip())
                     if file_pid == os.getpid():
@@ -263,11 +282,9 @@ def acquire_lock():
     except FileExistsError:
         print("Another instance is already running! Exiting.")
         sys.exit(1)
-    except FileNotFoundError:
-        # Directory may not exist
-        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
-        with open(LOCK_FILE, 'w') as f:
-            f.write(str(os.getpid()))
+    except Exception as e:
+        print(f"Lock error: {e}")
+        # If all else fails, try to continue
         return None
 # ------------------- MEMORY CHECK -------------------
 try:
@@ -1872,7 +1889,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
-    await asyncio.sleep(140)  # Let messages send
+    await asyncio.sleep(2)  # Let messages send
     
     # ===== CRITICAL: Close the lock handle BEFORE restart =====
     try:
@@ -2124,31 +2141,51 @@ if __name__ == "__main__":
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
         
-            # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
-                        # Small delay to ensure port is released
-            time.sleep(2)
-            
-            # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
+                        # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
             import socket
             from werkzeug.serving import make_server
+            import time
+            import struct
+            
+            # Check if port is already in use and wait if needed
+            for attempt in range(5):
+                try:
+                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    test_sock.bind(('0.0.0.0', args.port))
+                    test_sock.close()
+                    log(f"✅ Port {args.port} is free", args.telegram_token, args.chat_id)
+                    break
+                except OSError as e:
+                    if attempt < 4:
+                        log(f"⚠️ Port {args.port} in use, waiting 5 seconds... (attempt {attempt+1}/5)", 
+                            args.telegram_token, args.chat_id)
+                        time.sleep(5)
+                    else:
+                        log(f"❌ Port {args.port} still in use after 5 attempts. Using port {args.port+1} instead", 
+                            args.telegram_token, args.chat_id)
+                        args.port = args.port + 1
             
             # Create socket with SO_REUSEADDR
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            # Try to bind with retry
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    sock.bind(('0.0.0.0', args.port))
-                    break
-                except OSError as e:
-                    if attempt < max_retries - 1:
-                        log(f"Port {args.port} busy, retrying in 2s... (attempt {attempt+2}/{max_retries})", 
-                            args.telegram_token, args.chat_id)
-                        time.sleep(2)
-                    else:
-                        raise e
+            # Also set SO_LINGER to force close immediately
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            except:
+                pass  # SO_LINGER might not be available on all systems
+            
+            # Bind the socket
+            try:
+                sock.bind(('0.0.0.0', args.port))
+                log(f"✅ Successfully bound to port {args.port}", args.telegram_token, args.chat_id)
+            except OSError as e:
+                log(f"❌ Failed to bind to port {args.port}: {e}", args.telegram_token, args.chat_id)
+                # Try one more port
+                args.port = args.port + 1
+                sock.bind(('0.0.0.0', args.port))
+                log(f"✅ Successfully bound to alternate port {args.port}", args.telegram_token, args.chat_id)
             
             sock.listen(128)
             
@@ -2159,7 +2196,8 @@ if __name__ == "__main__":
             # Run in thread
             flask_thread = threading.Thread(target=server.serve_forever, daemon=True)
             flask_thread.start()
-            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", args.telegram_token, args.chat_id)
+            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", 
+                args.telegram_token, args.chat_id)
             # TELEGRAM IN MAIN THREAD - BLOCKING
             if args.telegram_token and args.chat_id:
                 try:
