@@ -1847,65 +1847,33 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /restart - safely restarts bot, preserves positions"""
-    global bot_state, args, LOCK_HANDLE  # Add LOCK_HANDLE here
+    global bot_state, args, LOCK_HANDLE
     
     chat_id = str(update.effective_chat.id)
-    
-    # Security check
     if chat_id != str(args.chat_id):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
-    # Check for active position
-    has_position = False
-    position_details = ""
-    if (bot_state.client and hasattr(bot_state, 'current_trade') and 
-        bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
-        has_position = True
-        position_details = (f"{bot_state.current_trade.side} "
-                           f"{bot_state.current_trade.qty} SOL "
-                           f"@ {bot_state.current_trade.entry_price:.2f}")
+    await update.message.reply_text("🔄 Restarting bot...")
     
-    # Reply with position info
-    if has_position:
-        await update.message.reply_text(
-            f"🔄 *Restarting with ACTIVE POSITION*\n\n"
-            f"📊 *Position:* {position_details}\n"
-            f"🛡️ *SL/TP orders stay on Binance*\n"
-            f"🤖 Bot will resume monitoring after restart\n\n"
-            f"Restarting in 2 seconds...",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.message.reply_text("🔄 Restarting bot now...")
+    # Set restart flag
+    bot_state.RESTART_REQUESTED = True
     
     # Save state
-    try:
-        save_bot_state()
-        await update.message.reply_text("💾 Trade history saved")
-    except:
-        await update.message.reply_text("⚠️ Save warning - restarting anyway")
+    save_bot_state()
     
     log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
-    await asyncio.sleep(2)  # Let messages send
-    
-    # ===== CRITICAL: Close the lock handle BEFORE restart =====
+    # Close lock handle
     try:
         if LOCK_HANDLE:
             LOCK_HANDLE.close()
-            print("Lock handle closed successfully for restart")
-        # Don't delete the lock file, just close the handle
-    except Exception as e:
-        print(f"Error closing lock handle during restart: {e}")
+    except:
+        pass
     
-    # Small delay to ensure everything is cleaned up
-    time.sleep(5)
+    # Exit - graceful_shutdown will handle the restart
+    sys.exit(0)
     
-    # ===== REAL PROCESS RESTART =====
-    import os, sys
-    os.execv(sys.executable, [sys.executable] + sys.argv)
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
     global bot_state, CMD_ARGS
@@ -2079,12 +2047,24 @@ if __name__ == "__main__":
             pass
         
         # On restart: force new PID by killing self after cleanup
+                # 4. On restart, REPLACE self with new process (same PID)
         if is_restart:
-            log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
-            time.sleep(2)  # Give logs time to send
-            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
-        else:
-            sys.exit(0)  # Normal shutdown
+            log("🔄 Restarting with EXECV - same PID, fresh memory", args.telegram_token, args.chat_id)
+            time.sleep(2)
+            # Close lock handle
+            try:
+                if LOCK_HANDLE:
+                    LOCK_HANDLE.close()
+            except:
+                pass
+            # Delete lock file (will be recreated)
+            try:
+                if os.path.exists(LOCK_FILE):
+                    os.unlink(LOCK_FILE)
+            except:
+                pass
+            # EXECV - replaces current process
+            os.execv(sys.executable, [sys.executable] + sys.argv)
     
     # Immortal loop
     while True:
