@@ -188,33 +188,37 @@ def acquire_lock():
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
                         
-                        # Check if process is still running
-                        process_exists = False
-                        if platform.system() == "Windows":
-                            import psutil
-                            try:
-                                psutil.Process(pid)
-                                process_exists = True
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                process_exists = False
+                        # Special case: if it's the same PID as current process, it's a restart
+                        if pid == os.getpid():
+                            print(f"Same PID {pid} - this is a restart, continuing...")
+                            # Just use the existing lock file
+                            pass
                         else:
-                            # Unix: try sending signal 0 to check if process exists
-                            try:
-                                os.kill(pid, 0)
-                                process_exists = True
-                            except OSError:
-                                process_exists = False
-                        
-                        if process_exists:
-                            # Process exists, another instance is running
-                            msg = f"Another instance already running with PID {pid}! Exiting."
-                            log(msg, args.telegram_token, args.chat_id)
-                            print(msg)
-                            sys.exit(1)
-                        else:
-                            # Stale lock - remove
-                            log(f"Removing stale lock from dead PID {pid}", args.telegram_token, args.chat_id)
-                            os.unlink(LOCK_FILE)
+                            # Check if process is still running
+                            process_exists = False
+                            if platform.system() == "Windows":
+                                import psutil
+                                try:
+                                    psutil.Process(pid)
+                                    process_exists = True
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    process_exists = False
+                            else:
+                                # Unix: try sending signal 0 to check if process exists
+                                try:
+                                    os.kill(pid, 0)
+                                    process_exists = True
+                                except OSError:
+                                    process_exists = False
+                            
+                            if process_exists:
+                                # Process exists, another instance is running
+                                print(f"Another instance is already running with PID {pid}! Exiting.")
+                                sys.exit(1)
+                            else:
+                                # Process doesn't exist, stale lock file
+                                print(f"Removing stale lock file from PID {pid}")
+                                os.unlink(LOCK_FILE)
             except Exception as e:
                 print(f"Error reading lock file: {e}")
                 # If we can't read/parse the lock file, remove it and continue
@@ -1826,49 +1830,65 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram /restart - BRUTE FORCE RESTART"""
-    global bot_state, args, LOCK_HANDLE
+    """Telegram /restart - safely restarts bot, preserves positions"""
+    global bot_state, args, LOCK_HANDLE  # Add LOCK_HANDLE here
     
     chat_id = str(update.effective_chat.id)
     
+    # Security check
     if chat_id != str(args.chat_id):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
-    await update.message.reply_text("💥 FORCE RESTARTING in 3 seconds...")
+    # Check for active position
+    has_position = False
+    position_details = ""
+    if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+        bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
+        has_position = True
+        position_details = (f"{bot_state.current_trade.side} "
+                           f"{bot_state.current_trade.qty} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.2f}")
+    
+    # Reply with position info
+    if has_position:
+        await update.message.reply_text(
+            f"🔄 *Restarting with ACTIVE POSITION*\n\n"
+            f"📊 *Position:* {position_details}\n"
+            f"🛡️ *SL/TP orders stay on Binance*\n"
+            f"🤖 Bot will resume monitoring after restart\n\n"
+            f"Restarting in 2 seconds...",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("🔄 Restarting bot now...")
     
     # Save state
-    save_bot_state()
+    try:
+        save_bot_state()
+        await update.message.reply_text("💾 Trade history saved")
+    except:
+        await update.message.reply_text("⚠️ Save warning - restarting anyway")
     
-    log("🔧 FORCE RESTART via Telegram", args.telegram_token, args.chat_id)
+    log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
-    # Close everything
+    await asyncio.sleep(2)  # Let messages send
+    
+    # ===== CRITICAL: Close the lock handle BEFORE restart =====
     try:
         if LOCK_HANDLE:
             LOCK_HANDLE.close()
-    except:
-        pass
+            print("Lock handle closed successfully for restart")
+        # Don't delete the lock file, just close the handle
+    except Exception as e:
+        print(f"Error closing lock handle during restart: {e}")
     
-    # Delete lock file
-    try:
-        if os.path.exists(LOCK_FILE):
-            os.unlink(LOCK_FILE)
-    except:
-        pass
+    # Small delay to ensure everything is cleaned up
+    time.sleep(3)
     
-    # Wait a moment
-    await asyncio.sleep(3)
-    
-    # FORCE KILL EVERYTHING ON THE PORT
-    import subprocess
-    subprocess.run(["sudo", "fuser", "-k", f"{args.port}/tcp"], stderr=subprocess.DEVNULL)
-    
-    # KILL OUR OWN PROCESS HARD
-    print("💀 FORCE KILLING current process...")
-    os.kill(os.getpid(), 9)  # SIGKILL
-    
-    # This line will never be reached
-    sys.exit(0)
+    # ===== REAL PROCESS RESTART =====
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
     global bot_state, CMD_ARGS
