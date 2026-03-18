@@ -2140,8 +2140,17 @@ if __name__ == "__main__":
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
+            
+            # ========== KILL ANY EXISTING FLASK PROCESS ON THIS PORT ==========
+            import subprocess
+            try:
+                subprocess.run(f"fuser -k {args.port}/tcp", shell=True, stderr=subprocess.DEVNULL)
+                log(f"Killed any process on port {args.port}", args.telegram_token, args.chat_id)
+                time.sleep(2)
+            except:
+                pass
         
-                        # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
+            # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
             import socket
             from werkzeug.serving import make_server
             import time
