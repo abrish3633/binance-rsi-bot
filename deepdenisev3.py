@@ -255,7 +255,8 @@ class FlaskServer:
             log(f"Port cleanup warning: {e}")
         
         log(f"🌐 Flask server stopped on port {self.port}")
-
+# Create global Flask server instance
+flask_server = FlaskServer()
 # Add health check endpoint
 @app.route('/health', methods=['GET'])
 def health():
