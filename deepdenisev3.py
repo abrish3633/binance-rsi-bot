@@ -174,12 +174,13 @@ class TradeState:
         # Risk
         self.risk: Optional[Decimal] = None
 # ------------------- FLASK SERVER MANAGEMENT -------------------
+# ------------------- FLASK SERVER MANAGEMENT (IMPROVED) -------------------
 class FlaskServer:
     def __init__(self):
-        self.server = None
         self.thread = None
         self.running = False
         self.port = None
+        self.server = None
     
     def start(self, port):
         self.port = port
@@ -187,37 +188,78 @@ class FlaskServer:
         self.thread = threading.Thread(
             target=self._run_flask,
             args=(port,),
-            daemon=False  # Changed to non-daemon so it survives restarts
+            daemon=False
         )
         self.thread.start()
         log(f"🌐 Flask server starting on port {port}")
-        time.sleep(2)  # Give it time to start
+        # Give it time to start and verify
+        time.sleep(3)
+        # Check if it's actually running
+        try:
+            requests.get(f"http://localhost:{port}/health", timeout=2)
+        except:
+            # If health check fails, try to see if it's a port conflict
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('localhost', port))
+            if result == 0:
+                log(f"✅ Port {port} is now in use - server running")
+            else:
+                log(f"⚠️ Port {port} check failed - might need investigation")
+            sock.close()
     
     def _run_flask(self, port):
         # This runs in a separate thread
-        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        try:
+            # Set SO_REUSEADDR to allow immediate reuse
+            from werkzeug.serving import make_server
+            self.server = make_server('0.0.0.0', port, app, threaded=True)
+            self.server.serve_forever()
+        except Exception as e:
+            log(f"❌ Flask server error: {e}")
     
     def stop(self):
         self.running = False
-        # Force shutdown by sending request to shutdown endpoint
+        log("🌐 Stopping Flask server...")
+        
+        # Method 1: Try graceful shutdown via endpoint
         try:
-            requests.post(f"http://localhost:{self.port}/shutdown", timeout=1)
+            requests.post(f"http://localhost:{self.port}/shutdown", timeout=2)
+            log("✅ Shutdown signal sent")
+            time.sleep(2)  # Give it time to shutdown
         except:
             pass
-        log("🌐 Flask server stopping")
+        
+        # Method 2: Force server shutdown
+        if self.server:
+            try:
+                self.server.shutdown()
+                log("✅ Server shutdown method called")
+                time.sleep(1)
+            except:
+                pass
+        
+        # Method 3: Last resort - kill any process on the port
+        try:
+            import subprocess
+            result = subprocess.run(['sudo', 'lsof', '-t', '-i', f':{self.port}'], 
+                                   capture_output=True, text=True)
+            if result.stdout.strip():
+                pids = result.stdout.strip().split('\n')
+                for pid in pids:
+                    if pid and pid != str(os.getpid()):
+                        log(f"Killing stale process on port {self.port}: PID {pid}")
+                        os.kill(int(pid), signal.SIGKILL)
+                        time.sleep(1)
+        except Exception as e:
+            log(f"Port cleanup warning: {e}")
+        
+        log(f"🌐 Flask server stopped on port {self.port}")
 
-# Create global Flask server instance
-flask_server = FlaskServer()
-
-# Add shutdown endpoint to Flask app
-@app.route('/shutdown', methods=['POST'])
-def shutdown():
-    func = request.environ.get('werkzeug.server.shutdown')
-    if func is None:
-        raise RuntimeError('Not running with Werkzeug Server')
-    func()
-    return "Server shutting down..."
-LOCK_HANDLE = None  # Add this line
+# Add health check endpoint
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok", "pid": os.getpid()}), 200
 # ------------------- SINGLE INSTANCE LOCK WITH PID CHECK (IMPROVED) -------------------
 def acquire_lock():
     """Acquire single instance lock with PID check to prevent stale locks."""
@@ -2059,12 +2101,28 @@ if __name__ == "__main__":
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
             args.telegram_token, args.chat_id)
         
-        # Stop Flask server gracefully
+        # Stop Flask server gracefully with more time
         try:
             flask_server.stop()
             log("🌐 Flask server stopped", args.telegram_token, args.chat_id)
+            time.sleep(3)  # Give it more time to release the port
         except Exception as e:
             log(f"Flask server stop error: {e}", args.telegram_token, args.chat_id)
+        
+        # Verify port is free
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('localhost', args.port))
+            if result != 0:
+                log(f"✅ Port {args.port} is free", args.telegram_token, args.chat_id)
+            else:
+                log(f"⚠️ Port {args.port} still in use, forcing...", args.telegram_token, args.chat_id)
+                # Force kill anything on the port
+                subprocess.run(['fuser', '-k', f'{args.port}/tcp'], capture_output=True)
+            sock.close()
+        except:
+            pass
         
         # EARLY lock cleanup - ALWAYS remove lock file on restart/shutdown
         try:
@@ -2116,7 +2174,7 @@ if __name__ == "__main__":
         # On restart: force new PID by killing self after cleanup
         if is_restart:
             log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
-            time.sleep(2)  # Give logs time to send
+            time.sleep(4)  # Extra time for port to be released
             os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
         else:
             sys.exit(0)  # Normal shutdown
