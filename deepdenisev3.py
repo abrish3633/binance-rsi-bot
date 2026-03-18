@@ -2164,16 +2164,10 @@ if __name__ == "__main__":
                 log("📱 Telegram command listener activated (/restart, /status, /balance, /help)",
                     args.telegram_token, args.chat_id)
             
-            # Start Flask in a thread
+                        # Start Flask in a thread
             flask_thread = threading.Thread(
                 target=app.run,
-                kwargs={
-                    'host': '0.0.0.0', 
-                    'port': args.port, 
-                    'debug': False, 
-                    'use_reloader': False,
-                    'options': {'reuse_addr': True}  # ← ADD THIS LINE
-                },
+                kwargs={'host': '0.0.0.0', 'port': args.port, 'debug': False, 'use_reloader': False},
                 daemon=True
             )
             flask_thread.start()
