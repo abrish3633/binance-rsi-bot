@@ -207,11 +207,13 @@ def acquire_lock():
                         
                         if process_exists:
                             # Process exists, another instance is running
-                            print(f"Another instance is already running with PID {pid}! Exiting.")
+                            msg = f"Another instance already running with PID {pid}! Exiting."
+                            log(msg, args.telegram_token, args.chat_id)
+                            print(msg)
                             sys.exit(1)
                         else:
-                            # Process doesn't exist, stale lock file
-                            print(f"Removing stale lock file from PID {pid}")
+                            # Stale lock - remove
+                            log(f"Removing stale lock from dead PID {pid}", args.telegram_token, args.chat_id)
                             os.unlink(LOCK_FILE)
             except Exception as e:
                 print(f"Error reading lock file: {e}")
@@ -1989,8 +1991,7 @@ if __name__ == "__main__":
     _shutdown_done = False
     
     def graceful_shutdown(sig=None, frame=None):
-        global _shutdown_done, bot_state, args, LOCK_HANDLE
-        
+        global _shutdown_done
         if _shutdown_done:
             return
         _shutdown_done = True
@@ -2008,23 +2009,10 @@ if __name__ == "__main__":
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
             args.telegram_token, args.chat_id)
         
-        # EARLY lock cleanup - ALWAYS remove lock file on restart/shutdown
-        try:
-            if 'LOCK_HANDLE' in globals() and LOCK_HANDLE:
-                try:
-                    LOCK_HANDLE.close()
-                except:
-                    pass
-            if os.path.exists(LOCK_FILE):
-                os.unlink(LOCK_FILE)
-                log("Lock file removed during shutdown", args.telegram_token, args.chat_id)
-        except Exception as e:
-            log(f"Lock cleanup error: {e}", args.telegram_token, args.chat_id)
-        
-        # Save state
+        # 1. Save state FIRST
         save_bot_state()
         
-        # Preserve position if restart
+        # 2. Preserve position if restart
         has_active_position = False
         pos_amt = Decimal('0')
         if bot_state.client and args.symbol:
@@ -2035,10 +2023,8 @@ if __name__ == "__main__":
                 pass
         
         if has_active_position:
-            log("🔄 Restart detected - preserving active position", 
-                args.telegram_token, args.chat_id)
-            log(f"Position preserved: {abs(float(pos_amt)):.2f} SOL", 
-                args.telegram_token, args.chat_id)
+            log("🔄 Restart detected - preserving active position", args.telegram_token, args.chat_id)
+            log(f"Position preserved: {abs(float(pos_amt)):.2f} SOL", args.telegram_token, args.chat_id)
         else:
             if bot_state.client and args.symbol:
                 try:
@@ -2046,22 +2032,28 @@ if __name__ == "__main__":
                 except Exception as e:
                     log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
         
+        # 3. CRITICAL: DELETE LOCK FILE BEFORE KILL
+        try:
+            if 'LOCK_HANDLE' in globals() and LOCK_HANDLE:
+                LOCK_HANDLE.close()
+            if os.path.exists(LOCK_FILE):
+                os.unlink(LOCK_FILE)
+                log("Lock file deleted BEFORE self-kill for restart", args.telegram_token, args.chat_id)
+        except Exception as e:
+            log(f"Lock cleanup failed before kill: {e}", args.telegram_token, args.chat_id)
+        
         goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
         if is_restart:
             goodbye += "\n🔄 Restarting with new process..."
         
-        try:
-            log(goodbye, args.telegram_token, args.chat_id)
-        except:
-            pass
+        log(goodbye, args.telegram_token, args.chat_id)
         
-        # On restart: force new PID by killing self after cleanup
+        # 4. Force new PID on restart by killing self
         if is_restart:
-            log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
-            time.sleep(2)  # Give logs time to send
-            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
+            log("Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
+            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill
         else:
-            sys.exit(0)  # Normal shutdown
+            sys.exit(0)
     
     # Immortal loop
     while True:
