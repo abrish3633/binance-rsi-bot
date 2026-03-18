@@ -1872,7 +1872,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
-    await asyncio.sleep(2)  # Let messages send
+    await asyncio.sleep(30)  # Let messages send
     
     # ===== CRITICAL: Close the lock handle BEFORE restart =====
     try:
@@ -1884,7 +1884,7 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error closing lock handle during restart: {e}")
     
     # Small delay to ensure everything is cleaned up
-    time.sleep(3)
+    time.sleep(5)
     
     # ===== REAL PROCESS RESTART =====
     import os, sys
