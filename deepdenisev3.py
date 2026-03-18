@@ -188,7 +188,7 @@ def acquire_lock():
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
                         
-                        # Special case: if it's the same PID as current process, it's a restart
+                        # Check if process is still running
                         process_exists = False
                         if platform.system() == "Windows":
                             import psutil
@@ -213,32 +213,6 @@ def acquire_lock():
                             # Process doesn't exist, stale lock file
                             print(f"Removing stale lock file from PID {pid}")
                             os.unlink(LOCK_FILE)
-                        else:
-                            # Check if process is still running
-                            process_exists = False
-                            if platform.system() == "Windows":
-                                import psutil
-                                try:
-                                    psutil.Process(pid)
-                                    process_exists = True
-                                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                    process_exists = False
-                            else:
-                                # Unix: try sending signal 0 to check if process exists
-                                try:
-                                    os.kill(pid, 0)
-                                    process_exists = True
-                                except OSError:
-                                    process_exists = False
-                            
-                            if process_exists:
-                                # Process exists, another instance is running
-                                print(f"Another instance is already running with PID {pid}! Exiting.")
-                                sys.exit(1)
-                            else:
-                                # Process doesn't exist, stale lock file
-                                print(f"Removing stale lock file from PID {pid}")
-                                os.unlink(LOCK_FILE)
             except Exception as e:
                 print(f"Error reading lock file: {e}")
                 # If we can't read/parse the lock file, remove it and continue
@@ -289,7 +263,6 @@ def acquire_lock():
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
         return None
-
 # ------------------- MEMORY CHECK -------------------
 try:
     import psutil
