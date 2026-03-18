@@ -173,6 +173,50 @@ class TradeState:
         
         # Risk
         self.risk: Optional[Decimal] = None
+# ------------------- FLASK SERVER MANAGEMENT -------------------
+class FlaskServer:
+    def __init__(self):
+        self.server = None
+        self.thread = None
+        self.running = False
+        self.port = None
+    
+    def start(self, port):
+        self.port = port
+        self.running = True
+        self.thread = threading.Thread(
+            target=self._run_flask,
+            args=(port,),
+            daemon=False  # Changed to non-daemon so it survives restarts
+        )
+        self.thread.start()
+        log(f"🌐 Flask server starting on port {port}")
+        time.sleep(2)  # Give it time to start
+    
+    def _run_flask(self, port):
+        # This runs in a separate thread
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    
+    def stop(self):
+        self.running = False
+        # Force shutdown by sending request to shutdown endpoint
+        try:
+            requests.post(f"http://localhost:{self.port}/shutdown", timeout=1)
+        except:
+            pass
+        log("🌐 Flask server stopping")
+
+# Create global Flask server instance
+flask_server = FlaskServer()
+
+# Add shutdown endpoint to Flask app
+@app.route('/shutdown', methods=['POST'])
+def shutdown():
+    func = request.environ.get('werkzeug.server.shutdown')
+    if func is None:
+        raise RuntimeError('Not running with Werkzeug Server')
+    func()
+    return "Server shutting down..."
 LOCK_HANDLE = None  # Add this line
 # ------------------- SINGLE INSTANCE LOCK WITH PID CHECK (IMPROVED) -------------------
 def acquire_lock():
@@ -1786,7 +1830,8 @@ def webhook():
         return "Invalid UID", 403
     
     # Process in background
-    threading.Thread(target=process_alert, args=(data,), daemon=True).start()
+    # Process in background with tiny delay to ensure transaction logs are written
+    threading.Thread(target=lambda: (time.sleep(0.1), process_alert(data)), daemon=True).start()
     
     return jsonify({"status": "ok"}), 200
 
@@ -1995,7 +2040,7 @@ if __name__ == "__main__":
     _shutdown_done = False
     
     def graceful_shutdown(sig=None, frame=None):
-        global _shutdown_done, bot_state, args, LOCK_HANDLE
+        global _shutdown_done, bot_state, args, LOCK_HANDLE, flask_server
         
         if _shutdown_done:
             return
@@ -2013,6 +2058,13 @@ if __name__ == "__main__":
         
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
             args.telegram_token, args.chat_id)
+        
+        # Stop Flask server gracefully
+        try:
+            flask_server.stop()
+            log("🌐 Flask server stopped", args.telegram_token, args.chat_id)
+        except Exception as e:
+            log(f"Flask server stop error: {e}", args.telegram_token, args.chat_id)
         
         # EARLY lock cleanup - ALWAYS remove lock file on restart/shutdown
         try:
@@ -2126,13 +2178,9 @@ if __name__ == "__main__":
         
             # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
             # Start Flask in a thread
-            flask_thread = threading.Thread(
-                target=app.run,
-                kwargs={'host': '0.0.0.0', 'port': args.port, 'debug': False, 'use_reloader': False},
-                daemon=True
-            )
-            flask_thread.start()
-            
+            # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
+            # Start Flask using our managed server
+            flask_server.start(args.port)
             log(f"Webhook listening on port {args.port}", args.telegram_token, args.chat_id)
             # TELEGRAM IN MAIN THREAD - BLOCKING
             if args.telegram_token and args.chat_id:
