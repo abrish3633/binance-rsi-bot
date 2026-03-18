@@ -173,54 +173,102 @@ class TradeState:
         
         # Risk
         self.risk: Optional[Decimal] = None
-
-# ------------------- SINGLE INSTANCE LOCK -------------------
+LOCK_HANDLE = None  # Add this line
+# ------------------- SINGLE INSTANCE LOCK WITH PID CHECK (IMPROVED) -------------------
 def acquire_lock():
+    """Acquire single instance lock with PID check to prevent stale locks."""
+    global LOCK_HANDLE
+    
     try:
+        # Check if lock file exists and contains a valid PID
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, 'r') as f:
                     pid_str = f.read().strip()
                     if pid_str and pid_str.isdigit():
                         pid = int(pid_str)
-                        if platform.system() == "Windows":
-                            import psutil
-                            try:
-                                psutil.Process(pid)
-                                print("Another instance is already running! Exiting.")
-                                sys.exit(1)
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                os.unlink(LOCK_FILE)
+                        
+                        # Special case: if it's the same PID as current process, it's a restart
+                        if pid == os.getpid():
+                            print(f"Same PID {pid} - this is a restart, continuing...")
+                            # Just use the existing lock file
+                            pass
                         else:
-                            try:
-                                os.kill(pid, 0)
-                                print("Another instance is already running! Exiting.")
+                            # Check if process is still running
+                            process_exists = False
+                            if platform.system() == "Windows":
+                                import psutil
+                                try:
+                                    psutil.Process(pid)
+                                    process_exists = True
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    process_exists = False
+                            else:
+                                # Unix: try sending signal 0 to check if process exists
+                                try:
+                                    os.kill(pid, 0)
+                                    process_exists = True
+                                except OSError:
+                                    process_exists = False
+                            
+                            if process_exists:
+                                # Process exists, another instance is running
+                                print(f"Another instance is already running with PID {pid}! Exiting.")
                                 sys.exit(1)
-                            except OSError:
+                            else:
+                                # Process doesn't exist, stale lock file
+                                print(f"Removing stale lock file from PID {pid}")
                                 os.unlink(LOCK_FILE)
-            except:
+            except Exception as e:
+                print(f"Error reading lock file: {e}")
+                # If we can't read/parse the lock file, remove it and continue
                 try:
                     os.unlink(LOCK_FILE)
                 except:
                     pass
         
+        # Create new lock file with current PID
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
+            f.flush()
+            os.fsync(f.fileno())  # Ensure it's written to disk
         
+        print(f"Lock file created with PID {os.getpid()}")
+        
+        # On Unix systems, add file locking
         if platform.system() != "Windows":
             try:
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(f"Exclusive file lock acquired")
+                # Keep lock file open while bot runs
                 return lock_handle
-            except Exception as e:
+            except (IOError, OSError) as e:
                 print(f"Failed to acquire file lock: {e}")
+                # If we can't get the lock, another instance might have it
+                # Check if it's our own PID
+                with open(LOCK_FILE, 'r') as f:
+                    file_pid = int(f.read().strip())
+                    if file_pid == os.getpid():
+                        print("Lock file has our PID but couldn't get lock - continuing anyway")
+                        return None
                 sys.exit(1)
+            except Exception as e:
+                print(f"Unexpected error acquiring lock: {e}")
+                sys.exit(1)
+        
         return None
-    except:
+        
+    except FileExistsError:
+        print("Another instance is already running! Exiting.")
+        sys.exit(1)
+    except FileNotFoundError:
+        # Directory may not exist
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
         return None
-
-LOCK_HANDLE = acquire_lock()
 
 # ------------------- MEMORY CHECK -------------------
 try:
@@ -894,7 +942,6 @@ def debug_and_recover_expired_orders(client: BinanceClient, symbol: str, trade_s
 # ------------------- MONITOR TRADE -------------------
 def monitor_trade(client: BinanceClient, symbol: str, trade_state: TradeState, tick_size: Decimal, telegram_bot: Optional[str], telegram_chat_id: Optional[str]):
     global bot_state
-    log("Monitoring active trade...", telegram_bot, telegram_chat_id)
     last_recovery_check = Decimal("0")
     
     # CRITICAL FIX: Close any existing WebSocket for this symbol
@@ -1785,20 +1832,20 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Telegram /restart - safely restarts bot, preserves positions"""
-    global bot_state, CMD_ARGS
+    global bot_state, args, LOCK_HANDLE  # Add LOCK_HANDLE here
     
     chat_id = str(update.effective_chat.id)
     
     # Security check
-    if chat_id != str(CMD_ARGS.chat_id):
+    if chat_id != str(args.chat_id):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
     # Check for active position
     has_position = False
     position_details = ""
-    if (bot_state.client and bot_state.current_trade and 
-        bot_state.current_trade.active and bot_state.current_trade.qty):
+    if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+        bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
         has_position = True
         position_details = (f"{bot_state.current_trade.side} "
                            f"{bot_state.current_trade.qty} SOL "
@@ -1824,9 +1871,21 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("⚠️ Save warning - restarting anyway")
     
-    log("🔧 Manual restart via Telegram", CMD_ARGS.telegram_token, CMD_ARGS.chat_id)
+    log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
     await asyncio.sleep(2)  # Let messages send
+    
+    # ===== CRITICAL: Close the lock handle BEFORE restart =====
+    try:
+        if LOCK_HANDLE:
+            LOCK_HANDLE.close()
+            print("Lock handle closed successfully for restart")
+        # Don't delete the lock file, just close the handle
+    except Exception as e:
+        print(f"Error closing lock handle during restart: {e}")
+    
+    # Small delay to ensure everything is cleaned up
+    time.sleep(1)
     
     # ===== REAL PROCESS RESTART =====
     import os, sys
@@ -1917,8 +1976,9 @@ if __name__ == "__main__":
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--no-news-guard", action="store_true", help="Disable news guard")
     parser.add_argument("--port", type=int, default=8080, help="Webhook port")
-    
     args = parser.parse_args()
+    
+    LOCK_HANDLE = acquire_lock()
     CMD_ARGS = args  # Store for webhook access
     
     if args.no_news_guard:
@@ -2046,7 +2106,6 @@ if __name__ == "__main__":
             mem_mb = psutil.Process().memory_info().rss / 1024 / 1024
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             log("🤖 Bot started successfully after restart", args.telegram_token, args.chat_id)
-            telegram_post(args.telegram_token, args.chat_id, "🤖 Bot restarted successfully")
             # Start scheduler thread
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
             
@@ -2115,29 +2174,12 @@ if __name__ == "__main__":
             
             log(f"Webhook listening on port {args.port}", args.telegram_token, args.chat_id)
             
-            log("Entering trading_loop() - will check restart flag every second", 
-                args.telegram_token, args.chat_id)
-            
             trading_loop(
                 client=bot_state.client,
                 symbol=args.symbol,
                 telegram_bot=args.telegram_token,
                 telegram_chat_id=args.chat_id
             )
-            
-            # This log proves trading_loop exited (rare, but useful for debug)
-            log("trading_loop() has returned - checking for restart flag",
-                args.telegram_token, args.chat_id)
-            # Debug: show flag state right after loop exits
-            log(f"trading_loop() exited | RESTART_REQUESTED = {bot_state.RESTART_REQUESTED}",
-                args.telegram_token, args.chat_id)
-            # Check restart flag after trading_loop exits (redundant but safe)
-            with bot_state._restart_lock:
-                if bot_state.RESTART_REQUESTED:
-                    log("Restart flag detected after trading_loop - restarting",
-                        args.telegram_token, args.chat_id)
-                    bot_state.RESTART_REQUESTED = False
-                    continue
             
             log("Bot stopped cleanly (no restart flag)", args.telegram_token, args.chat_id)
             break
