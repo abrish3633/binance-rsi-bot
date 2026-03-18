@@ -189,10 +189,30 @@ def acquire_lock():
                         pid = int(pid_str)
                         
                         # Special case: if it's the same PID as current process, it's a restart
-                        if pid == os.getpid():
-                            print(f"Same PID {pid} - this is a restart, continuing...")
-                            # Just use the existing lock file
-                            pass
+                        process_exists = False
+                        if platform.system() == "Windows":
+                            import psutil
+                            try:
+                                psutil.Process(pid)
+                                process_exists = True
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                process_exists = False
+                        else:
+                            # Unix: try sending signal 0 to check if process exists
+                            try:
+                                os.kill(pid, 0)
+                                process_exists = True
+                            except OSError:
+                                process_exists = False
+                        
+                        if process_exists:
+                            # Process exists, another instance is running
+                            print(f"Another instance is already running with PID {pid}! Exiting.")
+                            sys.exit(1)
+                        else:
+                            # Process doesn't exist, stale lock file
+                            print(f"Removing stale lock file from PID {pid}")
+                            os.unlink(LOCK_FILE)
                         else:
                             # Check if process is still running
                             process_exists = False
@@ -1995,8 +2015,9 @@ if __name__ == "__main__":
     # Shutdown handler (improved - early lock cleanup, sys.exit)
     _shutdown_done = False
     
-    def graceful_shutdown(sig=None, frame=None):
-        global _shutdown_done
+        def graceful_shutdown(sig=None, frame=None):
+        global _shutdown_done, bot_state, args, LOCK_HANDLE
+        
         if _shutdown_done:
             return
         _shutdown_done = True
@@ -2009,13 +2030,18 @@ if __name__ == "__main__":
         if os.path.exists("/tmp/STOP_BOT_NOW"):
             reason = "KILL FLAG / Manual stop"
         
+        is_restart = getattr(bot_state, "RESTART_REQUESTED", False)
+        
         log(f"🛑 Shutdown requested ({reason}). Cleaning up...", 
             args.telegram_token, args.chat_id)
         
-        # EARLY lock cleanup
+        # EARLY lock cleanup - ALWAYS remove lock file on restart/shutdown
         try:
             if 'LOCK_HANDLE' in globals() and LOCK_HANDLE:
-                LOCK_HANDLE.close()
+                try:
+                    LOCK_HANDLE.close()
+                except:
+                    pass
             if os.path.exists(LOCK_FILE):
                 os.unlink(LOCK_FILE)
                 log("Lock file removed during shutdown", args.telegram_token, args.chat_id)
@@ -2048,16 +2074,21 @@ if __name__ == "__main__":
                     log(f"Order cleanup error: {e}", args.telegram_token, args.chat_id)
         
         goodbye = f"BOT STOPPED\nSymbol: {args.symbol}\nReason: {reason}"
+        if is_restart:
+            goodbye += "\n🔄 Restarting with new process..."
+        
         try:
             log(goodbye, args.telegram_token, args.chat_id)
         except:
             pass
         
-        sys.exit(0)  # Clean exit - allows loop to restart
-    
-    signal.signal(signal.SIGINT, graceful_shutdown)
-    signal.signal(signal.SIGTERM, graceful_shutdown)
-    atexit.register(graceful_shutdown)
+        # On restart: force new PID by killing self after cleanup
+        if is_restart:
+            log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
+            time.sleep(2)  # Give logs time to send
+            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
+        else:
+            sys.exit(0)  # Normal shutdown
     
     # Immortal loop
     while True:
