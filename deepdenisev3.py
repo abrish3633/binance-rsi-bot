@@ -196,39 +196,20 @@ def acquire_lock():
                         else:
                             # Check if process is still running
                             process_exists = False
-                            
-                            # Better process checking
                             if platform.system() == "Windows":
                                 import psutil
                                 try:
-                                    # This is more reliable on Windows
-                                    process = psutil.Process(pid)
-                                    process_exists = process.is_running()
+                                    psutil.Process(pid)
+                                    process_exists = True
                                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                                     process_exists = False
                             else:
-                                # On Linux/Unix, try multiple methods
+                                # Unix: try sending signal 0 to check if process exists
                                 try:
-                                    # Method 1: Check if /proc/PID exists (most reliable on Linux)
-                                    if os.path.exists(f"/proc/{pid}"):
-                                        # Double-check it's actually a python process (optional)
-                                        try:
-                                            with open(f"/proc/{pid}/cmdline", 'r') as cmd_file:
-                                                cmdline = cmd_file.read()
-                                                if 'python' in cmdline:
-                                                    process_exists = True
-                                        except:
-                                            # If we can't read cmdline but /proc exists, assume it's running
-                                            process_exists = True
-                                    else:
-                                        process_exists = False
-                                except:
-                                    # Fallback to kill -0 method
-                                    try:
-                                        os.kill(pid, 0)
-                                        process_exists = True
-                                    except OSError:
-                                        process_exists = False
+                                    os.kill(pid, 0)
+                                    process_exists = True
+                                except OSError:
+                                    process_exists = False
                             
                             if process_exists:
                                 # Process exists, another instance is running
@@ -247,13 +228,12 @@ def acquire_lock():
                     pass
         
         # Create new lock file with current PID
-        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
         with open(LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
             f.flush()
             os.fsync(f.fileno())  # Ensure it's written to disk
         
-        print(f"✅ Lock file created with PID {os.getpid()}")
+        print(f"Lock file created with PID {os.getpid()}")
         
         # On Unix systems, add file locking
         if platform.system() != "Windows":
@@ -261,12 +241,13 @@ def acquire_lock():
                 import fcntl
                 lock_handle = open(LOCK_FILE, 'r+')
                 fcntl.lockf(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                print(f"✅ Exclusive file lock acquired")
+                print(f"Exclusive file lock acquired")
                 # Keep lock file open while bot runs
                 return lock_handle
             except (IOError, OSError) as e:
-                print(f"⚠️ Failed to acquire file lock: {e}")
-                # If we can't get the lock, but it's our PID, continue anyway
+                print(f"Failed to acquire file lock: {e}")
+                # If we can't get the lock, another instance might have it
+                # Check if it's our own PID
                 with open(LOCK_FILE, 'r') as f:
                     file_pid = int(f.read().strip())
                     if file_pid == os.getpid():
@@ -282,9 +263,11 @@ def acquire_lock():
     except FileExistsError:
         print("Another instance is already running! Exiting.")
         sys.exit(1)
-    except Exception as e:
-        print(f"Lock error: {e}")
-        # If all else fails, try to continue
+    except FileNotFoundError:
+        # Directory may not exist
+        os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
         return None
 # ------------------- MEMORY CHECK -------------------
 try:
@@ -1847,33 +1830,65 @@ def recover_existing_positions(client, symbol, tick_size, telegram_bot, telegram
 
 # ==================== TELEGRAM COMMAND HANDLERS ====================
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global bot_state, args, LOCK_HANDLE
+    """Telegram /restart - safely restarts bot, preserves positions"""
+    global bot_state, args, LOCK_HANDLE  # Add LOCK_HANDLE here
     
     chat_id = str(update.effective_chat.id)
+    
+    # Security check
     if chat_id != str(args.chat_id):
         await update.message.reply_text("❌ Unauthorized.")
         return
     
-    await update.message.reply_text("🔄 Restarting bot...")
+    # Check for active position
+    has_position = False
+    position_details = ""
+    if (bot_state.client and hasattr(bot_state, 'current_trade') and 
+        bot_state.current_trade and bot_state.current_trade.active and bot_state.current_trade.qty):
+        has_position = True
+        position_details = (f"{bot_state.current_trade.side} "
+                           f"{bot_state.current_trade.qty} SOL "
+                           f"@ {bot_state.current_trade.entry_price:.2f}")
     
-    # Set restart flag
-    bot_state.RESTART_REQUESTED = True
+    # Reply with position info
+    if has_position:
+        await update.message.reply_text(
+            f"🔄 *Restarting with ACTIVE POSITION*\n\n"
+            f"📊 *Position:* {position_details}\n"
+            f"🛡️ *SL/TP orders stay on Binance*\n"
+            f"🤖 Bot will resume monitoring after restart\n\n"
+            f"Restarting in 2 seconds...",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.message.reply_text("🔄 Restarting bot now...")
     
     # Save state
-    save_bot_state()
+    try:
+        save_bot_state()
+        await update.message.reply_text("💾 Trade history saved")
+    except:
+        await update.message.reply_text("⚠️ Save warning - restarting anyway")
     
     log("🔧 Manual restart via Telegram", args.telegram_token, args.chat_id)
     
-    # Close lock handle
+    await asyncio.sleep(2)  # Let messages send
+    
+    # ===== CRITICAL: Close the lock handle BEFORE restart =====
     try:
         if LOCK_HANDLE:
             LOCK_HANDLE.close()
-    except:
-        pass
+            print("Lock handle closed successfully for restart")
+        # Don't delete the lock file, just close the handle
+    except Exception as e:
+        print(f"Error closing lock handle during restart: {e}")
     
-    # Exit - graceful_shutdown will handle the restart
-    sys.exit(0)
+    # Small delay to ensure everything is cleaned up
+    time.sleep(3)
     
+    # ===== REAL PROCESS RESTART =====
+    import os, sys
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Command: /status — quick bot health check"""
     global bot_state, CMD_ARGS
@@ -2047,24 +2062,12 @@ if __name__ == "__main__":
             pass
         
         # On restart: force new PID by killing self after cleanup
-                # 4. On restart, REPLACE self with new process (same PID)
         if is_restart:
-            log("🔄 Restarting with EXECV - same PID, fresh memory", args.telegram_token, args.chat_id)
-            time.sleep(2)
-            # Close lock handle
-            try:
-                if LOCK_HANDLE:
-                    LOCK_HANDLE.close()
-            except:
-                pass
-            # Delete lock file (will be recreated)
-            try:
-                if os.path.exists(LOCK_FILE):
-                    os.unlink(LOCK_FILE)
-            except:
-                pass
-            # EXECV - replaces current process
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            log("💀 Self-killing current process to force new PID...", args.telegram_token, args.chat_id)
+            time.sleep(2)  # Give logs time to send
+            os.kill(os.getpid(), signal.SIGKILL)  # Immediate kill - outer loop restarts
+        else:
+            sys.exit(0)  # Normal shutdown
     
     # Immortal loop
     while True:
@@ -2120,73 +2123,17 @@ if __name__ == "__main__":
             log(f"🧠 Fresh process memory: {mem_mb:.1f} MB", args.telegram_token, args.chat_id)
             
             threading.Thread(target=lambda: run_scheduler(args.telegram_token, args.chat_id), daemon=True).start()
-            
-            # ========== KILL ANY EXISTING FLASK PROCESS ON THIS PORT ==========
-            import subprocess
-            try:
-                subprocess.run(f"fuser -k {args.port}/tcp", shell=True, stderr=subprocess.DEVNULL)
-                log(f"Killed any process on port {args.port}", args.telegram_token, args.chat_id)
-                time.sleep(2)
-            except:
-                pass
         
             # ========== START FLASK WEBHOOK SERVER WITH SO_REUSEADDR ==========
-            import socket
-            from werkzeug.serving import make_server
-            import time
-            import struct
-            
-            # Check if port is already in use and wait if needed
-            for attempt in range(5):
-                try:
-                    test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    test_sock.bind(('0.0.0.0', args.port))
-                    test_sock.close()
-                    log(f"✅ Port {args.port} is free", args.telegram_token, args.chat_id)
-                    break
-                except OSError as e:
-                    if attempt < 4:
-                        log(f"⚠️ Port {args.port} in use, waiting 5 seconds... (attempt {attempt+1}/5)", 
-                            args.telegram_token, args.chat_id)
-                        time.sleep(5)
-                    else:
-                        log(f"❌ Port {args.port} still in use after 5 attempts. Using port {args.port+1} instead", 
-                            args.telegram_token, args.chat_id)
-                        args.port = args.port + 1
-            
-            # Create socket with SO_REUSEADDR
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            
-            # Also set SO_LINGER to force close immediately
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-            except:
-                pass  # SO_LINGER might not be available on all systems
-            
-            # Bind the socket
-            try:
-                sock.bind(('0.0.0.0', args.port))
-                log(f"✅ Successfully bound to port {args.port}", args.telegram_token, args.chat_id)
-            except OSError as e:
-                log(f"❌ Failed to bind to port {args.port}: {e}", args.telegram_token, args.chat_id)
-                # Try one more port
-                args.port = args.port + 1
-                sock.bind(('0.0.0.0', args.port))
-                log(f"✅ Successfully bound to alternate port {args.port}", args.telegram_token, args.chat_id)
-            
-            sock.listen(128)
-            
-            # Create server with pre-bound socket
-            server = make_server('0.0.0.0', args.port, app, threaded=True, request_handler=None)
-            server.socket = sock
-            
-            # Run in thread
-            flask_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            # Start Flask in a thread
+            flask_thread = threading.Thread(
+                target=app.run,
+                kwargs={'host': '0.0.0.0', 'port': args.port, 'debug': False, 'use_reloader': False},
+                daemon=True
+            )
             flask_thread.start()
-            log(f"🌐 Webhook listening on port {args.port} with SO_REUSEADDR enabled", 
-                args.telegram_token, args.chat_id)
+            
+            log(f"Webhook listening on port {args.port}", args.telegram_token, args.chat_id)
             # TELEGRAM IN MAIN THREAD - BLOCKING
             if args.telegram_token and args.chat_id:
                 try:
