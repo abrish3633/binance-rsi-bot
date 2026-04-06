@@ -1390,46 +1390,58 @@ def run_scheduler(bot_token: Optional[str], chat_id: Optional[str]):
             last_month = current_date.month
 
     def daily_restart_job():
-        """Safe daily restart - preserves positions, really restarts process"""
-        global bot_state
+        """Safe daily restart - forces One-Way mode on every restart"""
+        global bot_state, args
         
-        # Check for active position
-        has_position = False
-        position_details = ""
-        if (bot_state.client and bot_state.current_trade and 
-            bot_state.current_trade.active and bot_state.current_trade.qty):
-            has_position = True
-            position_details = (f"{bot_state.current_trade.side} "
-                               f"{bot_state.current_trade.qty} SOL "
-                               f"@ {bot_state.current_trade.entry_price:.2f}")
+        log("🔄 Daily restart triggered...", args.telegram_token, args.chat_id)
         
-        log("🔄 DAILY RESTART: Starting real process restart...", 
-            args.telegram_token, args.chat_id)
-        
-        # Save state
+        # Save state first
         try:
             save_bot_state()
-            log("💾 State saved - trades preserved", args.telegram_token, args.chat_id)
+            log("💾 Bot state saved before restart", args.telegram_token, args.chat_id)
         except Exception as e:
             log(f"⚠️ State save warning: {e}", args.telegram_token, args.chat_id)
+
+        # Check for active position (more reliable check)
+        has_position = False
+        position_details = "No active position"
         
-        # Notify about position status
+        try:
+            if (bot_state.current_trade and 
+                bot_state.current_trade.active and 
+                bot_state.current_trade.qty):
+                has_position = True
+                position_details = (f"{bot_state.current_trade.side} "
+                                  f"{bot_state.current_trade.qty:.4f} SOL "
+                                  f"@ {bot_state.current_trade.entry_price:.4f}")
+            
+            # Also check real Binance position
+            real_pos = get_position_amt(bot_state.client, args.symbol) if bot_state.client else Decimal('0')
+            if real_pos != Decimal('0'):
+                has_position = True
+                position_details = f"Binance position: {abs(real_pos):.4f} SOL (orders preserved)"
+        except Exception as e:
+            log(f"Position check during restart failed: {e}", args.telegram_token, args.chat_id)
+
+        # Notify user
         if has_position:
-            msg = (f"🔄 Daily restart - POSITION PRESERVED!\n"
+            msg = (f"🔄 **Daily Restart**\n"
+                   f"📊 Position will be **preserved**\n"
                    f"{position_details}\n"
-                   f"SL/TP orders remain active on Binance")
+                   f"SL/TP/Trailing orders remain active on Binance\n"
+                   f"One-Way mode will be re-forced after restart.")
             telegram_post(args.telegram_token, args.chat_id, msg)
-            log(f"✅ Active position preserved: {position_details}", 
-                args.telegram_token, args.chat_id)
+            log(f"✅ Active position preserved: {position_details}", args.telegram_token, args.chat_id)
         else:
             telegram_post(args.telegram_token, args.chat_id, 
-                         "🔄 Daily restart - no active positions")
-        
-        time.sleep(7)  # Let messages send
-        
-        # ===== REAL PROCESS RESTART =====
-        log("🚀 Restarting Python process NOW - positions safe on Binance", 
+                         "🔄 Daily restart starting - no active positions detected")
+
+        time.sleep(3)  # Give Telegram time to deliver messages
+
+        log("🚀 Executing process restart now (One-Way mode will be forced on next start)", 
             args.telegram_token, args.chat_id)
+
+        # ===== REAL PROCESS RESTART =====
         import os, sys
         os.execv(sys.executable, [sys.executable] + sys.argv)
     
@@ -1975,6 +1987,8 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time.sleep(3)
     
     # ===== REAL PROCESS RESTART =====
+    log("🚀 Executing manual restart now (One-Way mode will be forced)", 
+        args.telegram_token, args.chat_id)
     import os, sys
     os.execv(sys.executable, [sys.executable] + sys.argv)
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2210,7 +2224,21 @@ if __name__ == "__main__":
             bot_state.client = BinanceClient(args.api_key, args.api_secret, use_live=args.live, base_override=args.base_url)
             balance = fetch_balance(bot_state.client)
             bot_state.account_size = balance
-            
+            # === FORCE ONE-WAY MODE ON EVERY RESTART ===
+            try:
+                bot_state.client.send_signed_request(
+                    "POST", 
+                    "/fapi/v1/positionSide/dual", 
+                    {"dualSidePosition": "false"}
+                )
+                log("✅ Successfully forced ONE-WAY mode", args.telegram_token, args.chat_id)
+            except Exception as e:
+                error_msg = str(e).lower()
+                if any(k in error_msg for k in ["position", "cannot change", "has position", "already"]):
+                    log("ℹ️ One-Way mode is already set or cannot be changed right now (positions may exist)", 
+                        args.telegram_token, args.chat_id)
+                else:
+                    log(f"⚠️ Failed to force One-Way mode: {e}", args.telegram_token, args.chat_id)
             leverage_to_set = 5
             bot_state.client.set_leverage(args.symbol, leverage_to_set)
             log(f"Set leverage to {leverage_to_set}x", args.telegram_token, args.chat_id)
